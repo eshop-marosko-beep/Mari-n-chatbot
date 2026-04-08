@@ -18,6 +18,10 @@ Tvoja odpoveď má byť stručná, užitočná a v slovenčine."""
 
 conversations = {}
 
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({"message": "DeepSeek chatbot API beží. Použite /chat endpoint."})
+
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
@@ -50,6 +54,9 @@ def chat():
         ai_response = response.json()["choices"][0]["message"]["content"]
         
         conversations[session_id].append({"role": "assistant", "content": ai_response})
+        
+        if len(conversations[session_id]) > 10:
+            conversations[session_id] = conversations[session_id][-10:]
         
         return jsonify({"success": True, "response": ai_response})
     except Exception as e:
