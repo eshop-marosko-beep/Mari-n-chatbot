@@ -7,7 +7,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+
+# 🔧 OPRAVA CORS - povolí tvoju e-shop doménu
+CORS(app, origins=['https://eshop.marosko.sk', 'https://www.eshop.marosko.sk'])
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -69,5 +71,4 @@ def health():
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
 
-# Toto je pre Gunicorn na Renderi
 application = app
