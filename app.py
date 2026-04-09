@@ -2,17 +2,22 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from dotenv import load_dotenv
-
-load_dotenv()
 
 app = Flask(__name__)
 
-# 🔧 OPRAVA CORS - povolí tvoju e-shop doménu
+# Povolenie CORS pre tvoju doménu
 CORS(app, origins=['https://eshop.marosko.sk', 'https://www.eshop.marosko.sk'])
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# Načítanie API kľúča z prostredia Renderu
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+# --- DEBUG: Vypíšeme do logov, či sa kľúč načítal ---
+if DEEPSEEK_API_KEY:
+    print(f"✅ DEEPSEEK_API_KEY loaded successfully. Starts with: {DEEPSEEK_API_KEY[:10]}...")
+else:
+    print("❌ FATAL: DEEPSEEK_API_KEY is NOT set in environment variables!")
+# -------------------------------------------------
 
 SYSTEM_PROMPT = """Si odborný poradca pre rezbárske náradie na e-shope marosko.sk.
 Pomáhaš zákazníkom s výberom správneho náradia.
@@ -26,6 +31,10 @@ def home():
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Ak nie je kľúč, vrátime zrozumiteľnú chybu
+    if not DEEPSEEK_API_KEY:
+        return jsonify({"success": False, "error": "Server not configured: API key missing. Please set DEEPSEEK_API_KEY in Render environment."}), 500
+
     data = request.json
     user_message = data.get('message', '')
     session_id = data.get('session_id', 'default')
@@ -51,7 +60,7 @@ def chat():
     }
     
     try:
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload)
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         ai_response = response.json()["choices"][0]["message"]["content"]
         
@@ -66,9 +75,7 @@ def chat():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "api_key_configured": bool(DEEPSEEK_API_KEY)})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
-
-application = app
