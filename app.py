@@ -14,7 +14,6 @@ from langchain.chains import RetrievalQA
 from langchain_community.llms import OpenAI
 
 app = Flask(__name__)
-# Povol CORS pre tvoju doménu (prípadne nahraď presnou adresou e-shopu)
 CORS(app, origins=['https://eshop.marosko.sk', 'https://www.eshop.marosko.sk'])
 
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
@@ -23,7 +22,6 @@ if not DEEPSEEK_API_KEY:
 else:
     print(f"DEBUG: API key loaded: {DEEPSEEK_API_KEY[:10]}...")
 
-# ---------- 1. NAČÍTANIE PRODUKTOV Z XML FEEDU (Heureka) ----------
 PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
 PRODUCT_CHROMA_PATH = "/tmp/product_chroma"
 
@@ -48,11 +46,9 @@ def fetch_and_index_products():
         price_vat = item.findtext("PRICE_VAT", "")
         url = item.findtext("URL", "")
         description = item.findtext("DESCRIPTION", "")
-        # Odstránime HTML tagy z popisu
         clean_desc = re.sub(r'<[^>]+>', ' ', description)
         clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
 
-        # Vytvoríme text pre embedding (názov, výrobca, cena, časť popisu, link)
         content = f"""
 Názov: {name}
 Výrobca: {manufacturer}
@@ -86,7 +82,6 @@ Link na produkt: {url}
     print(f"✅ Indexovaných {len(documents)} produktov.")
     return vectordb
 
-# ---------- 2. NAČÍTANIE VŠEOBECNÝCH DOKUMENTOV (tvoje PDF/TXT) ----------
 DOCS_FOLDER = "docs"
 GENERAL_CHROMA_PATH = "/tmp/general_chroma"
 
@@ -122,11 +117,9 @@ def load_and_index_general_docs():
     print(f"✅ Indexovaných {len(chunks)} všeobecných častí dokumentov.")
     return vectordb
 
-# ---------- 3. INICIALIZÁCIA VŠETKÝCH DB ----------
 product_db = fetch_and_index_products()
 general_db = load_and_index_general_docs()
 
-# ---------- 4. RETRIEVAL QA REŤAZCE ----------
 qa_product = None
 if product_db:
     product_retriever = product_db.as_retriever(search_kwargs={"k": 3})
@@ -157,14 +150,12 @@ if general_db:
     )
     print("🧠 Všeobecný RAG pripravený.")
 
-# ---------- 5. ENDPOINT /chat ----------
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
     user_msg = data.get("message", "")
     session_id = data.get("session_id", str(uuid.uuid4()))
 
-    # 1. Skúsime najprv nájsť relevantné produkty
     product_answer = None
     if qa_product:
         try:
@@ -173,12 +164,10 @@ def chat():
         except Exception as e:
             print("Chyba pri produktovom RAG:", e)
 
-    # 2. Ak sa pýta na kúpu/cenu/link, odpovieme s odkazom (aj keď RAG našiel niečo)
     lower_msg = user_msg.lower()
     is_buy_question = any(word in lower_msg for word in ["kúp", "cena", "koľko stojí", "objednať", "link", "odkaz", "kde kúpim"])
 
     if is_buy_question and product_answer:
-        # Pokúsime sa nájsť URL v odpovedi
         match = re.search(r'(https?://[^\s]+)', product_answer)
         if match:
             link = match.group(1)
@@ -187,11 +176,9 @@ def chat():
             final = product_answer
         return jsonify({"success": True, "response": final})
 
-    # 3. Inak ak máme produktovú odpoveď, pošleme ju
     if product_answer:
         return jsonify({"success": True, "response": product_answer})
 
-    # 4. Ak nie je otázka na produkt, skús všeobecné dokumenty
     if qa_general:
         try:
             general_answer = qa_general.invoke({"query": user_msg})
@@ -199,7 +186,6 @@ def chat():
         except Exception as e:
             print("Chyba pri všeobecnom RAG:", e)
 
-    # 5. Fallback – priamy DeepSeek (bez RAG)
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
