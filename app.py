@@ -35,43 +35,55 @@ def load_products_from_xml():
         price_vat = item.findtext("PRICE_VAT", "")
         url = item.findtext("URL", "")
         description = item.findtext("DESCRIPTION", "")
-        # Odstránime HTML tagy z popisu
         clean_desc = re.sub(r'<[^>]+>', ' ', description)
         clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
         
         products.append({
             "name": name.lower(),
+            "original_name": name,
             "manufacturer": manufacturer.lower(),
             "price": price_vat,
             "url": url,
-            "description": clean_desc[:1500]  # prvých 1500 znakov
+            "description": clean_desc[:1500]
         })
     print(f"✅ Načítaných {len(products)} produktov.")
     return products
 
 products = load_products_from_xml()
 
-# ------------------ VYHĽADÁVANIE PRODUKTOV ------------------
+# ------------------ PRESNÉ VYHĽADÁVANIE ------------------
 def find_product(query):
     query_lower = query.lower()
+    # Rozdelíme otázku na slová (odstránime krátke slová)
+    words = [w for w in query_lower.split() if len(w) > 2]
+    
     best_match = None
     best_score = 0
+    best_match_type = "weak"  # "exact", "strong", "weak"
     
     for p in products:
         score = 0
-        words = query_lower.split()
+        # 1. Skús nájsť presnú frázu (celý názov produktu v otázke)
+        if p['name'] in query_lower:
+            score += 100
+            best_match_type = "exact"
+        # 2. Hľadanie slov v názve (každé slovo)
         for word in words:
-            if len(word) < 3:
-                continue
             if word in p['name']:
-                score += 3
+                score += 10
             if word in p['manufacturer']:
-                score += 2
+                score += 5
+        # 3. Bonus za výrobcu, ak je spomenutý
+        if any(word in p['manufacturer'] for word in words):
+            score += 20
+            
         if score > best_score:
             best_score = score
             best_match = p
+            best_match_type = "strong" if score >= 20 else "weak"
     
-    if best_score >= 2:
+    # Ak je skóre nízke (<15) a nie je to presná zhoda, nechceme produkt vrátiť
+    if best_score >= 15 or best_match_type == "exact":
         return best_match
     return None
 
@@ -85,16 +97,18 @@ def chat():
     product = find_product(user_msg)
     
     if product:
-        # Ak ide o otázku na kúpu/cenu, odpovedz priamo
+        # Ak je otázka na cenu/kúpu – odpovedz priamo
         lower_msg = user_msg.lower()
-        if any(word in lower_msg for word in ["kúp", "cena", "koľko stojí", "objednať", "link"]):
+        is_price_question = any(word in lower_msg for word in ["cena", "koľko stojí", "kúp", "objednať", "link"])
+        
+        if is_price_question:
             return jsonify({
                 "success": True,
-                "response": f"**{product['name'].title()}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}"
+                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}"
             })
         
-        # Inak – odborná otázka – použijeme DeepSeek s popisom produktu
-        prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe tohto popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, stručne, odborne a užitočne.
+        # Odborná otázka – použijeme DeepSeek na základe popisu
+        prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe nasledujúceho popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, odborne, ale zrozumiteľne. Nepridávaj informácie, ktoré nie sú v popise.
 
 POPIS PRODUKTU:
 {product['description']}
@@ -102,7 +116,7 @@ POPIS PRODUKTU:
 OTÁZKA POUŽÍVATEĽA:
 {user_msg}
 
-TVOJA ODPOVEĎ (len na základe popisu, nepridávaj vlastné vedomosti):"""
+TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
         
         headers = {
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -118,18 +132,16 @@ TVOJA ODPOVEĎ (len na základe popisu, nepridávaj vlastné vedomosti):"""
             resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
             ai_msg = resp.json()["choices"][0]["message"]["content"]
-            # Na koniec pridáme odkaz na produkt
-            final_response = f"{ai_msg}\n\n👉 **Produkt:** {product['name'].title()} – {product['price']} €\n🔗 **Kúpiť:** {product['url']}"
+            final_response = f"{ai_msg}\n\n---\n**Produkt:** {product['original_name']} – {product['price']} €\n🔗 **Kúpiť:** {product['url']}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
             print(f"Chyba pri DeepSeek: {e}")
-            # Fallback – aspoň základné info
             return jsonify({
                 "success": True,
-                "response": f"**{product['name'].title()}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}\n\n(Podrobné info momentálne nedostupné, skúste neskôr.)"
+                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}\n\n(pre podrobnosti nás kontaktujte)"
             })
     
-    # 2. Ak nenašiel produkt, použijeme všeobecný DeepSeek
+    # 2. Žiadny relevantný produkt – použijeme všeobecný DeepSeek
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -137,7 +149,7 @@ TVOJA ODPOVEĎ (len na základe popisu, nepridávaj vlastné vedomosti):"""
     payload = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "Si odborný poradca pre rezbárske náradie. Odpovedaj stručne, užitočne, v slovenčine."},
+            {"role": "system", "content": "Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to."},
             {"role": "user", "content": user_msg}
         ],
         "stream": False
