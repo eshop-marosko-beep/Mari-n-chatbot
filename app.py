@@ -30,22 +30,28 @@ def load_products_from_xml():
 
     products = []
     for item in root.findall(".//SHOPITEM"):
-        name = item.findtext("PRODUCTNAME", "").lower()
-        manufacturer = item.findtext("MANUFACTURER", "").lower()
+        name = item.findtext("PRODUCTNAME", "")
+        manufacturer = item.findtext("MANUFACTURER", "")
         price_vat = item.findtext("PRICE_VAT", "")
         url = item.findtext("URL", "")
+        description = item.findtext("DESCRIPTION", "")
+        # Odstránime HTML tagy z popisu
+        clean_desc = re.sub(r'<[^>]+>', ' ', description)
+        clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
+        
         products.append({
-            "name": name,
-            "manufacturer": manufacturer,
+            "name": name.lower(),
+            "manufacturer": manufacturer.lower(),
             "price": price_vat,
-            "url": url
+            "url": url,
+            "description": clean_desc[:1500]  # prvých 1500 znakov
         })
     print(f"✅ Načítaných {len(products)} produktov.")
     return products
 
 products = load_products_from_xml()
 
-# ------------------ JEDNODUCHÉ VYHĽADÁVANIE PRODUKTOV ------------------
+# ------------------ VYHĽADÁVANIE PRODUKTOV ------------------
 def find_product(query):
     query_lower = query.lower()
     best_match = None
@@ -53,7 +59,6 @@ def find_product(query):
     
     for p in products:
         score = 0
-        # Hľadá slová z otázky v názve alebo výrobcovi
         words = query_lower.split()
         for word in words:
             if len(word) < 3:
@@ -78,13 +83,53 @@ def chat():
     
     # 1. Skús nájsť produkt
     product = find_product(user_msg)
-    if product:
-        return jsonify({
-            "success": True,
-            "response": f"**{product['name'].title()}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}"
-        })
     
-    # 2. Ak nenašiel, použijeme DeepSeek API
+    if product:
+        # Ak ide o otázku na kúpu/cenu, odpovedz priamo
+        lower_msg = user_msg.lower()
+        if any(word in lower_msg for word in ["kúp", "cena", "koľko stojí", "objednať", "link"]):
+            return jsonify({
+                "success": True,
+                "response": f"**{product['name'].title()}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}"
+            })
+        
+        # Inak – odborná otázka – použijeme DeepSeek s popisom produktu
+        prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe tohto popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, stručne, odborne a užitočne.
+
+POPIS PRODUKTU:
+{product['description']}
+
+OTÁZKA POUŽÍVATEĽA:
+{user_msg}
+
+TVOJA ODPOVEĎ (len na základe popisu, nepridávaj vlastné vedomosti):"""
+        
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0.3
+        }
+        try:
+            resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            ai_msg = resp.json()["choices"][0]["message"]["content"]
+            # Na koniec pridáme odkaz na produkt
+            final_response = f"{ai_msg}\n\n👉 **Produkt:** {product['name'].title()} – {product['price']} €\n🔗 **Kúpiť:** {product['url']}"
+            return jsonify({"success": True, "response": final_response})
+        except Exception as e:
+            print(f"Chyba pri DeepSeek: {e}")
+            # Fallback – aspoň základné info
+            return jsonify({
+                "success": True,
+                "response": f"**{product['name'].title()}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}\n\n(Podrobné info momentálne nedostupné, skúste neskôr.)"
+            })
+    
+    # 2. Ak nenašiel produkt, použijeme všeobecný DeepSeek
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
