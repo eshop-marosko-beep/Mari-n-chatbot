@@ -9,6 +9,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app, origins=['https://eshop.marosko.sk', 'https://www.eshop.marosko.sk'])
 
+# ------------------ KONFIGURÁCIA ------------------
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
 if not DEEPSEEK_API_KEY:
     print("FATAL: DEEPSEEK_API_KEY is NOT set!")
@@ -17,7 +18,26 @@ else:
 
 PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
 
-# ------------------ NAČÍTANIE PRODUKTOV Z XML ------------------
+# 🆕 URL pre llms.txt (môžete zmeniť na https://eshop.marosko.sk/llms.txt ak chcete)
+LLMS_TXT_URL = "https://marosko.sk/llms.txt"
+
+# ------------------ NAČÍTANIE llms.txt (kontext webu) ------------------
+def load_llms_context():
+    """Stiahne llms.txt a vráti jeho obsah ako reťazec."""
+    print("🔄 Sťahujem llms.txt...")
+    try:
+        resp = requests.get(LLMS_TXT_URL, timeout=10)
+        resp.raise_for_status()
+        print("✅ llms.txt načítaný.")
+        return resp.text
+    except Exception as e:
+        print(f"❌ Chyba pri načítaní llms.txt: {e}")
+        return ""   # ak sa nepodarí načítať, použije sa prázdny reťazec
+
+# Globálna premenná – načíta sa pri štarte servera
+llms_context = load_llms_context()
+
+# ------------------ NAČÍTANIE PRODUKTOV Z XML (HEUREKA feed) ------------------
 def load_products_from_xml():
     print("🔄 Sťahujem XML feed produktov...")
     try:
@@ -35,6 +55,7 @@ def load_products_from_xml():
         price_vat = item.findtext("PRICE_VAT", "")
         url = item.findtext("URL", "")
         description = item.findtext("DESCRIPTION", "")
+        # Vyčistenie HTML značiek z popisu
         clean_desc = re.sub(r'<[^>]+>', ' ', description)
         clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
         
@@ -44,14 +65,14 @@ def load_products_from_xml():
             "manufacturer": manufacturer.lower(),
             "price": price_vat,
             "url": url,
-            "description": clean_desc[:1500]
+            "description": clean_desc[:1500]   # skrátenie kvôli tokenom
         })
     print(f"✅ Načítaných {len(products)} produktov.")
     return products
 
 products = load_products_from_xml()
 
-# ------------------ PRESNÉ VYHĽADÁVANIE ------------------
+# ------------------ PRESNÉ VYHĽADÁVANIE PRODUKTU V OTÁZKE ------------------
 def find_product(query):
     query_lower = query.lower()
     # Rozdelíme otázku na slová (odstránime krátke slová)
@@ -107,7 +128,7 @@ def chat():
                 "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}"
             })
         
-        # Odborná otázka – použijeme DeepSeek na základe popisu
+        # Odborná otázka – použijeme DeepSeek na základe popisu produktu
         prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe nasledujúceho popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, odborne, ale zrozumiteľne. Nepridávaj informácie, ktoré nie sú v popise.
 
 POPIS PRODUKTU:
@@ -135,13 +156,27 @@ TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
             final_response = f"{ai_msg}\n\n---\n**Produkt:** {product['original_name']} – {product['price']} €\n🔗 **Kúpiť:** {product['url']}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
-            print(f"Chyba pri DeepSeek: {e}")
+            print(f"Chyba pri DeepSeek (produktová otázka): {e}")
+            # Záložná odpoveď bez AI
             return jsonify({
                 "success": True,
                 "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}\n\n(pre podrobnosti nás kontaktujte)"
             })
     
-    # 2. Žiadny relevantný produkt – použijeme všeobecný DeepSeek
+    # 2. Žiadny relevantný produkt – použijeme všeobecný DeepSeek s kontextom z llms.txt
+    # 🆕 Pripravíme systémový prompt, ktorý obsahuje llms.txt (ak je dostupný)
+    if llms_context and llms_context.strip():
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to.
+
+Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
+
+{llms_context}
+
+Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
+    else:
+        # Záložný prompt, ak sa llms.txt nepodarilo načítať
+        system_prompt = "Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to."
+
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -149,10 +184,11 @@ TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
     payload = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg}
         ],
-        "stream": False
+        "stream": False,
+        "temperature": 0.5
     }
     try:
         resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
@@ -160,11 +196,14 @@ TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
         ai_msg = resp.json()["choices"][0]["message"]["content"]
         return jsonify({"success": True, "response": ai_msg})
     except Exception as e:
+        print(f"Chyba pri DeepSeek (všeobecná otázka): {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ------------------ HEALTH CHECK ------------------
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
+# ------------------ SPUSTENIE ------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
