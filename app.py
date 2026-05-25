@@ -122,10 +122,12 @@ def chat():
         lower_msg = user_msg.lower()
         is_price_question = any(word in lower_msg for word in ["cena", "koľko stojí", "kúp", "objednať", "link"])
         
-        if is_price_question:
+                if is_price_question:
+            # Odstránenie zátvoriek z URL
+            clean_url = product['url'].rstrip(')').rstrip('(')
             return jsonify({
                 "success": True,
-                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}"
+                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url}"
             })
         
         # Odborná otázka – použijeme DeepSeek na základe popisu produktu
