@@ -17,11 +17,38 @@ else:
     print(f"DEBUG: API key loaded: {DEEPSEEK_API_KEY[:10]}...")
 
 PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
-
-# 🆕 URL pre llms.txt (môžete zmeniť na https://eshop.marosko.sk/llms.txt ak chcete)
 LLMS_TXT_URL = "https://marosko.sk/llms.txt"
 
-# ------------------ NAČÍTANIE llms.txt (kontext webu) ------------------
+# ------------------ POMOCNÁ FUNKCIA NA ČISTENIE URL ------------------
+def clean_url(url):
+    """Odstráni zátvorky z URL."""
+    if not url:
+        return url
+    # Odstrániť zátvorky z konca a začiatku
+    url = url.rstrip(')').rstrip('(').lstrip('(').lstrip(')')
+    # Odstrániť markdown syntax [text](url) - extrahuje iba URL
+    match = re.search(r'\]\((https?://[^)\s]+)\)', url)
+    if match:
+        url = match.group(1)
+    return url
+
+def clean_ai_response(response_text):
+    """Vyčistí AI odpoveď od zátvoriek v URL."""
+    # Nájdi všetky URL v odpovedi
+    url_pattern = r'https?://[^\s)]+'
+    urls = re.findall(url_pattern, response_text)
+    
+    for url in urls:
+        clean = clean_url(url)
+        if clean != url:
+            response_text = response_text.replace(url, clean)
+    
+    # Odstrániť markdown odkazy formátu [text](url) - premeniť na čistý text s URL
+    response_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', response_text)
+    
+    return response_text
+
+# ------------------ NAČÍTANIE llms.txt ------------------
 def load_llms_context():
     """Stiahne llms.txt a vráti jeho obsah ako reťazec."""
     print("🔄 Sťahujem llms.txt...")
@@ -32,12 +59,11 @@ def load_llms_context():
         return resp.text
     except Exception as e:
         print(f"❌ Chyba pri načítaní llms.txt: {e}")
-        return ""   # ak sa nepodarí načítať, použije sa prázdny reťazec
+        return ""
 
-# Globálna premenná – načíta sa pri štarte servera
 llms_context = load_llms_context()
 
-# ------------------ NAČÍTANIE PRODUKTOV Z XML (HEUREKA feed) ------------------
+# ------------------ NAČÍTANIE PRODUKTOV Z XML ------------------
 def load_products_from_xml():
     print("🔄 Sťahujem XML feed produktov...")
     try:
@@ -64,37 +90,33 @@ def load_products_from_xml():
             "original_name": name,
             "manufacturer": manufacturer.lower(),
             "price": price_vat,
-            "url": url,
-            "description": clean_desc[:1500]   # skrátenie kvôli tokenom
+            "url": clean_url(url),  # Vyčisti URL už pri načítaní
+            "description": clean_desc[:1500]
         })
     print(f"✅ Načítaných {len(products)} produktov.")
     return products
 
 products = load_products_from_xml()
 
-# ------------------ PRESNÉ VYHĽADÁVANIE PRODUKTU V OTÁZKE ------------------
+# ------------------ VYHĽADÁVANIE PRODUKTU ------------------
 def find_product(query):
     query_lower = query.lower()
-    # Rozdelíme otázku na slová (odstránime krátke slová)
     words = [w for w in query_lower.split() if len(w) > 2]
     
     best_match = None
     best_score = 0
-    best_match_type = "weak"  # "exact", "strong", "weak"
+    best_match_type = "weak"
     
     for p in products:
         score = 0
-        # 1. Skús nájsť presnú frázu (celý názov produktu v otázke)
         if p['name'] in query_lower:
             score += 100
             best_match_type = "exact"
-        # 2. Hľadanie slov v názve (každé slovo)
         for word in words:
             if word in p['name']:
                 score += 10
             if word in p['manufacturer']:
                 score += 5
-        # 3. Bonus za výrobcu, ak je spomenutý
         if any(word in p['manufacturer'] for word in words):
             score += 20
             
@@ -103,7 +125,6 @@ def find_product(query):
             best_match = p
             best_match_type = "strong" if score >= 20 else "weak"
     
-    # Ak je skóre nízke (<15) a nie je to presná zhoda, nechceme produkt vrátiť
     if best_score >= 15 or best_match_type == "exact":
         return best_match
     return None
@@ -114,24 +135,20 @@ def chat():
     data = request.get_json()
     user_msg = data.get("message", "")
     
-    # 1. Skús nájsť produkt
     product = find_product(user_msg)
     
     if product:
-        # Ak je otázka na cenu/kúpu – odpovedz priamo
         lower_msg = user_msg.lower()
         is_price_question = any(word in lower_msg for word in ["cena", "koľko stojí", "kúp", "objednať", "link"])
         
         if is_price_question:
-            # Odstránenie zátvoriek z URL
-            clean_url = product['url'].rstrip(')').rstrip('(')
+            clean_url_link = clean_url(product['url'])
             return jsonify({
                 "success": True,
-                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url}"
+                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url_link}"
             })
         
-        # Odborná otázka – použijeme DeepSeek na základe popisu produktu
-        prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe nasledujúceho popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, odborne, ale zrozumiteľne. Nepridávaj informácie, ktoré nie sú v popise.
+        prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe nasledujúceho popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, odborne, ale zrozumiteľne. Nepridávaj informácie, ktoré nie sú v popise. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
 POPIS PRODUKTU:
 {product['description']}
@@ -155,20 +172,22 @@ TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
             resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
             ai_msg = resp.json()["choices"][0]["message"]["content"]
-            final_response = f"{ai_msg}\n\n---\n**Produkt:** {product['original_name']} – {product['price']} €\n🔗 **Kúpiť:** {product['url']}"
+            # Vyčisti AI odpoveď od zátvoriek v URL
+            ai_msg = clean_ai_response(ai_msg)
+            clean_url_link = clean_url(product['url'])
+            final_response = f"{ai_msg}\n\n---\n**Produkt:** {product['original_name']} – {product['price']} €\n🔗 **Kúpiť:** {clean_url_link}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
             print(f"Chyba pri DeepSeek (produktová otázka): {e}")
-            # Záložná odpoveď bez AI
+            clean_url_link = clean_url(product['url'])
             return jsonify({
                 "success": True,
-                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {product['url']}\n\n(pre podrobnosti nás kontaktujte)"
+                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url_link}\n\n(pre podrobnosti nás kontaktujte)"
             })
     
-    # 2. Žiadny relevantný produkt – použijeme všeobecný DeepSeek s kontextom z llms.txt
-    # 🆕 Pripravíme systémový prompt, ktorý obsahuje llms.txt (ak je dostupný)
+    # Všeobecná otázka
     if llms_context and llms_context.strip():
-        system_prompt = f"""Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to.
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
@@ -176,8 +195,7 @@ Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, 
 
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        # Záložný prompt, ak sa llms.txt nepodarilo načítať
-        system_prompt = "Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to."
+        system_prompt = "Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
 
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -196,6 +214,8 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
         resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         ai_msg = resp.json()["choices"][0]["message"]["content"]
+        # Vyčisti AI odpoveď od zátvoriek v URL
+        ai_msg = clean_ai_response(ai_msg)
         return jsonify({"success": True, "response": ai_msg})
     except Exception as e:
         print(f"Chyba pri DeepSeek (všeobecná otázka): {e}")
