@@ -122,7 +122,7 @@ def chat():
         lower_msg = user_msg.lower()
         is_price_question = any(word in lower_msg for word in ["cena", "koľko stojí", "kúp", "objednať", "link"])
         
-                if is_price_question:
+        if is_price_question:
             # Odstránenie zátvoriek z URL
             clean_url = product['url'].rstrip(')').rstrip('(')
             return jsonify({
