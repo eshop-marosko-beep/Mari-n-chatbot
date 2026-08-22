@@ -136,28 +136,29 @@ def chat():
     user_msg = data.get("message", "")
     
     product = find_product(user_msg)
-    
+
     if product:
-        lower_msg = user_msg.lower()
-        is_price_question = any(word in lower_msg for word in ["cena", "koľko stojí", "kúp", "objednať", "link"])
-        
-        if is_price_question:
-            clean_url_link = clean_url(product['url'])
-            return jsonify({
-                "success": True,
-                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url_link}"
-            })
-        
-        prompt = f"""Si odborný poradca pre rezbárske náradie. Na základe nasledujúceho popisu produktu odpovedz na otázku používateľa. Odpovedaj v slovenčine, odborne, ale zrozumiteľne. Nepridávaj informácie, ktoré nie sú v popise. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
+        # Cena, výrobca aj odkaz idú do promptu vždy spolu s popisom — predtým sa
+        # otázky na cenu rozpoznávali len podľa presného výskytu fráz ako
+        # "koľko stojí" (bez diakritiky/preklepu sa to netrafilo), a keď sa
+        # netrafilo, AI dostalo do kontextu len POPIS produktu bez ceny a
+        # odpovedalo, že cenu nepozná — hoci bola k dispozícii a pripojila sa
+        # v samostatnej karte pod odpoveďou. Jeden spoločný prompt so všetkými
+        # údajmi to rieši bez ohľadu na presné znenie otázky.
+        clean_url_link = clean_url(product['url'])
+        prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. Odpovedz prirodzene, vecne a v plných vetách po slovensky — nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza, úprimne to priznaj namiesto vymýšľania. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
-POPIS PRODUKTU:
-{product['description']}
+PRODUKT: {product['original_name']}
+VÝROBCA: {product['manufacturer']}
+CENA: {product['price']} € s DPH
+ODKAZ NA KÚPU: {clean_url_link}
+POPIS: {product['description']}
 
-OTÁZKA POUŽÍVATEĽA:
+OTÁZKA ZÁKAZNÍKA:
 {user_msg}
 
-TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
-        
+TVOJA ODPOVEĎ:"""
+
         headers = {
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
             "Content-Type": "application/json"
@@ -166,7 +167,7 @@ TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
             "model": "deepseek-chat",
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "temperature": 0.3
+            "temperature": 0.4
         }
         try:
             resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
@@ -174,12 +175,10 @@ TVOJA ODPOVEĎ (len z popisu, ak niečo nie je jasné, priznaj to):"""
             ai_msg = resp.json()["choices"][0]["message"]["content"]
             # Vyčisti AI odpoveď od zátvoriek v URL
             ai_msg = clean_ai_response(ai_msg)
-            clean_url_link = clean_url(product['url'])
             final_response = f"{ai_msg}\n\n---\n**Produkt:** {product['original_name']} – {product['price']} €\n🔗 **Kúpiť:** {clean_url_link}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
             print(f"Chyba pri DeepSeek (produktová otázka): {e}")
-            clean_url_link = clean_url(product['url'])
             return jsonify({
                 "success": True,
                 "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url_link}\n\n(pre podrobnosti nás kontaktujte)"
