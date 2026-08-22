@@ -19,6 +19,18 @@ else:
 PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
 LLMS_TXT_URL = "https://marosko.sk/llms.txt"
 
+# ------------------ JAZYK ODPOVEDE ------------------
+LANGUAGE_NAMES = {
+    "sk": "Slovak (slovenčina)",
+    "cz": "Czech (čeština)",
+    "en": "English",
+    "ro": "Romanian (română)",
+}
+
+def resolve_language(locale):
+    """Namapuje locale z frontendu (sk/cz/en/ro) na názov jazyka pre prompt."""
+    return LANGUAGE_NAMES.get(locale, LANGUAGE_NAMES["sk"])
+
 # ------------------ POMOCNÁ FUNKCIA NA ČISTENIE URL ------------------
 def clean_url(url):
     """Odstráni zátvorky z URL."""
@@ -134,7 +146,8 @@ def find_product(query):
 def chat():
     data = request.get_json()
     user_msg = data.get("message", "")
-    
+    language = resolve_language(data.get("locale"))
+
     product = find_product(user_msg)
 
     if product:
@@ -146,7 +159,7 @@ def chat():
         # v samostatnej karte pod odpoveďou. Jeden spoločný prompt so všetkými
         # údajmi to rieši bez ohľadu na presné znenie otázky.
         clean_url_link = clean_url(product['url'])
-        prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. Odpovedz prirodzene, vecne a v plných vetách po slovensky — nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza, úprimne to priznaj namiesto vymýšľania. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
+        prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. DÔLEŽITÉ: Celú odpoveď napíš v jazyku {language}, bez ohľadu na to, že údaje o produkte nižšie sú v slovenčine — preformuluj ich do jazyka {language}. Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza, úprimne to priznaj namiesto vymýšľania. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
 PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
@@ -157,7 +170,7 @@ POPIS: {product['description']}
 OTÁZKA ZÁKAZNÍKA:
 {user_msg}
 
-TVOJA ODPOVEĎ:"""
+TVOJA ODPOVEĎ (v jazyku {language}):"""
 
         headers = {
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -186,7 +199,7 @@ TVOJA ODPOVEĎ:"""
     
     # Všeobecná otázka
     if llms_context and llms_context.strip():
-        system_prompt = f"""Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. DÔLEŽITÉ: Odpovedaj VÝLUČNE v jazyku {language}, aj keď sú nasledujúce informácie o e-shope v slovenčine. Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
@@ -194,7 +207,7 @@ Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, 
 
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        system_prompt = "Si odborný poradca pre rezbárske náradie. Odpovedaj v slovenčine, užitočne a presne. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
+        system_prompt = f"Si odborný poradca pre rezbárske náradie. Odpovedaj VÝLUČNE v jazyku {language}, užitočne a presne. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
 
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
