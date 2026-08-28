@@ -20,30 +20,47 @@ PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
 LLMS_TXT_URL = "https://marosko.sk/llms.txt"
 
 # ------------------ JAZYK ODPOVEDE ------------------
-LANGUAGE_NAMES = {
-    "sk": "Slovak (slovenčina)",
-    "cz": "Czech (čeština)",
-    "en": "English",
-    "ro": "Romanian (română)",
-}
+# Jazyk odpovede sa určuje z jazyka OTÁZKY (nie z locale frontendu):
+# slovenčina/čeština/rumunčina → odpovie v tom istom jazyku, čokoľvek
+# iné (napr. angličtina) → odpovie po slovensky.
 
 # Štítky pre kartu s cenou/odkazom, ktorá sa pripája mechanicky za AI
 # odpoveď (a pre núdzovú odpoveď pri zlyhaní DeepSeek) — tieto texty
-# AI nevidí, takže sa musia prekladať samostatne podľa locale.
+# AI nevidí, takže sa musia prekladať samostatne.
 LABELS = {
     "sk": {"product": "Produkt", "buy": "Kúpiť", "price": "Cena", "vat_suffix": "s DPH", "contact": "pre podrobnosti nás kontaktujte"},
     "cz": {"product": "Produkt", "buy": "Koupit", "price": "Cena", "vat_suffix": "s DPH", "contact": "pro podrobnosti nás kontaktujte"},
-    "en": {"product": "Product", "buy": "Buy", "price": "Price", "vat_suffix": "incl. VAT", "contact": "please contact us for details"},
     "ro": {"product": "Produs", "buy": "Cumpără", "price": "Preț", "vat_suffix": "cu TVA", "contact": "pentru detalii ne puteți contacta"},
 }
 
-def normalize_locale(locale):
-    """Normalizuje locale z frontendu na jeden z podporovaných kódov, fallback sk."""
-    return locale if locale in LANGUAGE_NAMES else "sk"
+# AI dostane pokyn uviesť na prvom riadku svojej odpovede značku v tomto
+# tvare (napr. "LANG:sk"), aby backend vedel, ktoré štítky použiť pre
+# kartu s cenou/odkazom — túto značku parsujeme a z výslednej odpovede
+# odstránime.
+LANG_TAG_RE = re.compile(r'^[\s*_]*LANG:\s*(sk|cz|ro)[\s*_]*\n+', re.IGNORECASE)
 
-def resolve_language(locale):
-    """Namapuje locale z frontendu (sk/cz/en/ro) na názov jazyka pre prompt."""
-    return LANGUAGE_NAMES[normalize_locale(locale)]
+LANGUAGE_INSTRUCTION = """DÔLEŽITÉ - JAZYK ODPOVEDE: Zisti, v akom jazyku je napísaná otázka zákazníka.
+- Ak je v slovenčine, češtine alebo rumunčine, odpovedz v tom istom jazyku.
+- Ak je v akomkoľvek inom jazyku (napríklad v angličtine), odpovedz po slovensky.
+Prvý riadok svojej odpovede napíš presne v tvare "LANG:sk", "LANG:cz" alebo "LANG:ro" (podľa jazyka, v ktorom odpovedáš), za ním prázdny riadok a až potom samotnú odpoveď."""
+
+def detect_locale_heuristic(text):
+    """Núdzový odhad jazyka podľa charakteristických diakritických znakov —
+    použije sa len keď AI odpoveď nie je k dispozícii (zlyhanie DeepSeek)."""
+    t = (text or "").lower()
+    if any(ch in t for ch in "ăâîșşțţ"):
+        return "ro"
+    if any(ch in t for ch in "ěřů"):
+        return "cz"
+    return "sk"
+
+def extract_language(ai_text, fallback_source):
+    """Vyparsuje značku LANG:xx z odpovede AI a vráti (locale, odpoveď bez značky).
+    Ak AI značku nedodrží, jazyk sa odhadne z pôvodnej otázky."""
+    match = LANG_TAG_RE.match(ai_text)
+    if match:
+        return match.group(1).lower(), ai_text[match.end():]
+    return detect_locale_heuristic(fallback_source), ai_text
 
 # ------------------ POMOCNÁ FUNKCIA NA ČISTENIE URL ------------------
 def clean_url(url):
@@ -160,9 +177,6 @@ def find_product(query):
 def chat():
     data = request.get_json()
     user_msg = data.get("message", "")
-    locale = normalize_locale(data.get("locale"))
-    language = LANGUAGE_NAMES[locale]
-    labels = LABELS[locale]
 
     product = find_product(user_msg)
 
@@ -175,7 +189,11 @@ def chat():
         # v samostatnej karte pod odpoveďou. Jeden spoločný prompt so všetkými
         # údajmi to rieši bez ohľadu na presné znenie otázky.
         clean_url_link = clean_url(product['url'])
-        prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. DÔLEŽITÉ: Celú odpoveď napíš v jazyku {language}, bez ohľadu na to, že údaje o produkte nižšie sú v slovenčine — preformuluj ich do jazyka {language}. Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza, úprimne to priznaj namiesto vymýšľania. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
+        prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie.
+
+{LANGUAGE_INSTRUCTION}
+
+Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza, úprimne to priznaj namiesto vymýšľania. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Údaje o produkte nižšie sú v slovenčine — ak odpovedáš v inom jazyku, preformuluj ich.
 
 PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
@@ -186,7 +204,7 @@ POPIS: {product['description']}
 OTÁZKA ZÁKAZNÍKA:
 {user_msg}
 
-TVOJA ODPOVEĎ (v jazyku {language}):"""
+TVOJA ODPOVEĎ (začni riadkom LANG:xx):"""
 
         headers = {
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -201,13 +219,16 @@ TVOJA ODPOVEĎ (v jazyku {language}):"""
         try:
             resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
-            ai_msg = resp.json()["choices"][0]["message"]["content"]
+            ai_msg_raw = resp.json()["choices"][0]["message"]["content"]
+            locale, ai_msg = extract_language(ai_msg_raw, user_msg)
+            labels = LABELS[locale]
             # Vyčisti AI odpoveď od zátvoriek v URL
             ai_msg = clean_ai_response(ai_msg)
             final_response = f"{ai_msg}\n\n---\n**{labels['product']}:** {product['original_name']} – {product['price']} €\n🔗 **{labels['buy']}:** {clean_url_link}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
             print(f"Chyba pri DeepSeek (produktová otázka): {e}")
+            labels = LABELS[detect_locale_heuristic(user_msg)]
             return jsonify({
                 "success": True,
                 "response": f"**{product['original_name']}**\n{labels['price']}: {product['price']} € {labels['vat_suffix']}\n\n👉 {labels['buy']}: {clean_url_link}\n\n({labels['contact']})"
@@ -215,7 +236,7 @@ TVOJA ODPOVEĎ (v jazyku {language}):"""
     
     # Všeobecná otázka
     if llms_context and llms_context.strip():
-        system_prompt = f"""Si odborný poradca pre rezbárske náradie. DÔLEŽITÉ: Odpovedaj VÝLUČNE v jazyku {language}, aj keď sú nasledujúce informácie o e-shope v slovenčine. Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
@@ -223,7 +244,7 @@ Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, 
 
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        system_prompt = f"Si odborný poradca pre rezbárske náradie. Odpovedaj VÝLUČNE v jazyku {language}, užitočne a presne. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
+        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
 
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -241,7 +262,8 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
     try:
         resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
-        ai_msg = resp.json()["choices"][0]["message"]["content"]
+        ai_msg_raw = resp.json()["choices"][0]["message"]["content"]
+        _, ai_msg = extract_language(ai_msg_raw, user_msg)
         # Vyčisti AI odpoveď od zátvoriek v URL
         ai_msg = clean_ai_response(ai_msg)
         return jsonify({"success": True, "response": ai_msg})
