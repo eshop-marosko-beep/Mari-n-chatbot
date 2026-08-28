@@ -27,9 +27,23 @@ LANGUAGE_NAMES = {
     "ro": "Romanian (română)",
 }
 
+# Štítky pre kartu s cenou/odkazom, ktorá sa pripája mechanicky za AI
+# odpoveď (a pre núdzovú odpoveď pri zlyhaní DeepSeek) — tieto texty
+# AI nevidí, takže sa musia prekladať samostatne podľa locale.
+LABELS = {
+    "sk": {"product": "Produkt", "buy": "Kúpiť", "price": "Cena", "vat_suffix": "s DPH", "contact": "pre podrobnosti nás kontaktujte"},
+    "cz": {"product": "Produkt", "buy": "Koupit", "price": "Cena", "vat_suffix": "s DPH", "contact": "pro podrobnosti nás kontaktujte"},
+    "en": {"product": "Product", "buy": "Buy", "price": "Price", "vat_suffix": "incl. VAT", "contact": "please contact us for details"},
+    "ro": {"product": "Produs", "buy": "Cumpără", "price": "Preț", "vat_suffix": "cu TVA", "contact": "pentru detalii ne puteți contacta"},
+}
+
+def normalize_locale(locale):
+    """Normalizuje locale z frontendu na jeden z podporovaných kódov, fallback sk."""
+    return locale if locale in LANGUAGE_NAMES else "sk"
+
 def resolve_language(locale):
     """Namapuje locale z frontendu (sk/cz/en/ro) na názov jazyka pre prompt."""
-    return LANGUAGE_NAMES.get(locale, LANGUAGE_NAMES["sk"])
+    return LANGUAGE_NAMES[normalize_locale(locale)]
 
 # ------------------ POMOCNÁ FUNKCIA NA ČISTENIE URL ------------------
 def clean_url(url):
@@ -146,7 +160,9 @@ def find_product(query):
 def chat():
     data = request.get_json()
     user_msg = data.get("message", "")
-    language = resolve_language(data.get("locale"))
+    locale = normalize_locale(data.get("locale"))
+    language = LANGUAGE_NAMES[locale]
+    labels = LABELS[locale]
 
     product = find_product(user_msg)
 
@@ -188,13 +204,13 @@ TVOJA ODPOVEĎ (v jazyku {language}):"""
             ai_msg = resp.json()["choices"][0]["message"]["content"]
             # Vyčisti AI odpoveď od zátvoriek v URL
             ai_msg = clean_ai_response(ai_msg)
-            final_response = f"{ai_msg}\n\n---\n**Produkt:** {product['original_name']} – {product['price']} €\n🔗 **Kúpiť:** {clean_url_link}"
+            final_response = f"{ai_msg}\n\n---\n**{labels['product']}:** {product['original_name']} – {product['price']} €\n🔗 **{labels['buy']}:** {clean_url_link}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
             print(f"Chyba pri DeepSeek (produktová otázka): {e}")
             return jsonify({
                 "success": True,
-                "response": f"**{product['original_name']}**\nCena: {product['price']} € s DPH\n\n👉 Kúpiť: {clean_url_link}\n\n(pre podrobnosti nás kontaktujte)"
+                "response": f"**{product['original_name']}**\n{labels['price']}: {product['price']} € {labels['vat_suffix']}\n\n👉 {labels['buy']}: {clean_url_link}\n\n({labels['contact']})"
             })
     
     # Všeobecná otázka
