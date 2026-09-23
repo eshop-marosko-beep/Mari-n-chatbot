@@ -4,6 +4,7 @@ import time
 import uuid
 import requests
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -19,6 +20,28 @@ else:
 
 PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
 LLMS_TXT_URL = "https://www.marosko.sk/llms.txt"  # canonical host; the bare domain 308-redirects here
+
+# ------------------ KONVERZAČNÁ PAMÄŤ ------------------
+# Predtým bola každá požiadavka úplne bez pamäti — session_id prišiel od
+# frontendu, ale backend ho nikde nepoužil, takže bot si nič nepamätal medzi
+# správami v tej istej konverzácii (napr. opravu od zákazníka o dva riadky
+# vyššie). Uchovávame posledných pár výmen za session_id a vkladáme ich do
+# promptu ako históriu, aby bot naozaj "pokračoval v konverzácii".
+conversations = OrderedDict()  # session_id -> [{"role": "user"|"assistant", "content": str}, ...]
+MAX_HISTORY_MESSAGES = 12  # posledných 6 výmen (user+assistant)
+MAX_SESSIONS = 500  # ochrana proti neobmedzenému rastu pamäte na dlho bežiacom procese
+
+def get_history(session_id):
+    return conversations.get(session_id, [])
+
+def append_to_history(session_id, user_msg, assistant_msg):
+    history = conversations.setdefault(session_id, [])
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
+    del history[:-MAX_HISTORY_MESSAGES]
+    conversations.move_to_end(session_id)
+    while len(conversations) > MAX_SESSIONS:
+        conversations.popitem(last=False)
 
 # ------------------ JAZYK ODPOVEDE ------------------
 # Jazyk odpovede sa určuje z jazyka OTÁZKY (nie z locale frontendu):
@@ -205,6 +228,8 @@ def find_product(query):
 def chat():
     data = request.get_json()
     user_msg = data.get("message", "")
+    session_id = data.get("session_id") or "default"
+    history = get_history(session_id)
 
     product = find_product(user_msg)
 
@@ -217,7 +242,7 @@ def chat():
         # v samostatnej karte pod odpoveďou. Jeden spoločný prompt so všetkými
         # údajmi to rieši bez ohľadu na presné znenie otázky.
         clean_url_link = clean_url(product['url'])
-        prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie.
+        system_prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii — napríklad ak ťa zákazník už opravil alebo doplnil, neopakuj pôvodnú chybu.
 
 {LANGUAGE_INSTRUCTION}
 
@@ -227,12 +252,11 @@ PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
 CENA: {product['price']} € s DPH
 ODKAZ NA KÚPU: {clean_url_link}
-POPIS: {product['description']}
+POPIS: {product['description']}"""
 
-OTÁZKA ZÁKAZNÍKA:
-{user_msg}
-
-TVOJA ODPOVEĎ (začni riadkom LANG:xx):"""
+        messages = [{"role": "system", "content": system_prompt}] + history + [
+            {"role": "user", "content": user_msg}
+        ]
 
         headers = {
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -240,7 +264,7 @@ TVOJA ODPOVEĎ (začni riadkom LANG:xx):"""
         }
         payload = {
             "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "stream": False,
             "temperature": 0.4
         }
@@ -252,6 +276,7 @@ TVOJA ODPOVEĎ (začni riadkom LANG:xx):"""
             labels = LABELS[locale]
             # Vyčisti AI odpoveď od zátvoriek v URL
             ai_msg = clean_ai_response(ai_msg)
+            append_to_history(session_id, user_msg, ai_msg)
             final_response = f"{ai_msg}\n\n---\n**{labels['product']}:** {product['original_name']} – {product['price']} €\n🔗 **{labels['buy']}:** {clean_url_link}"
             return jsonify({"success": True, "response": final_response})
         except Exception as e:
@@ -261,11 +286,11 @@ TVOJA ODPOVEĎ (začni riadkom LANG:xx):"""
                 "success": True,
                 "response": f"**{product['original_name']}**\n{labels['price']}: {product['price']} € {labels['vat_suffix']}\n\n👉 {labels['buy']}: {clean_url_link}\n\n({labels['contact']})"
             })
-    
+
     # Všeobecná otázka
     current_llms_context = get_llms_context()
     if current_llms_context and current_llms_context.strip():
-        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
@@ -275,16 +300,17 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
     else:
         system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
 
+    messages = [{"role": "system", "content": system_prompt}] + history + [
+        {"role": "user", "content": user_msg}
+    ]
+
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
         "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg}
-        ],
+        "messages": messages,
         "stream": False,
         "temperature": 0.5
     }
@@ -295,6 +321,7 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
         _, ai_msg = extract_language(ai_msg_raw, user_msg)
         # Vyčisti AI odpoveď od zátvoriek v URL
         ai_msg = clean_ai_response(ai_msg)
+        append_to_history(session_id, user_msg, ai_msg)
         return jsonify({"success": True, "response": ai_msg})
     except Exception as e:
         print(f"Chyba pri DeepSeek (všeobecná otázka): {e}")
