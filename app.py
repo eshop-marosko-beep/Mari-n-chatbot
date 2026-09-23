@@ -194,32 +194,45 @@ def get_products():
 
 # ------------------ VYHĽADÁVANIE PRODUKTU ------------------
 def find_product(query):
+    """Nájde produkt, o ktorom sa zákazník pravdepodobne pýta.
+
+    Zhoda ostáva na podreťazcoch (nie na celých slovách) zámerne — pri
+    bohatej slovenskej/českej skloňovanej flektológii to funguje ako
+    chudobná náhrada stemmingu (napr. "trojuholníkový" z otázky sa trafí
+    do "trojuholníkovým" v názve produktu). Predtým však vedela SAMOTNÁ
+    zhoda vo výrobcovi (`manufacturer`) sama o sebe pretiahnuť prah a
+    vrátiť celkom nesúvisiaci produkt, keď sa niektoré slovo z otázky
+    náhodou vyskytlo ako podreťazec v poli výrobcu niektorého z ~1250
+    produktov — bez akejkoľvek súvislosti s tým, o čom sa reálne
+    rozprávalo. Výrobca teda odteraz môže len PRIDAŤ body k produktu,
+    ktorý už má aspoň jednu zhodu vo vlastnom názve, nikdy nie sám o sebe
+    rozhodnúť."""
     query_lower = query.lower()
     words = [w for w in query_lower.split() if len(w) > 2]
 
     best_match = None
     best_score = 0
-    best_match_type = "weak"
 
     for p in get_products():
-        score = 0
+        name_score = 0
         if p['name'] in query_lower:
-            score += 100
-            best_match_type = "exact"
+            name_score += 100
         for word in words:
             if word in p['name']:
-                score += 10
+                name_score += 10
+        if name_score == 0:
+            continue
+
+        score = name_score
+        for word in words:
             if word in p['manufacturer']:
                 score += 5
-        if any(word in p['manufacturer'] for word in words):
-            score += 20
-            
+
         if score > best_score:
             best_score = score
             best_match = p
-            best_match_type = "strong" if score >= 20 else "weak"
-    
-    if best_score >= 15 or best_match_type == "exact":
+
+    if best_score >= 15:
         return best_match
     return None
 
