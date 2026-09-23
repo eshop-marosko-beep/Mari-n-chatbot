@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import uuid
 import requests
 import xml.etree.ElementTree as ET
@@ -17,7 +18,7 @@ else:
     print(f"DEBUG: API key loaded: {DEEPSEEK_API_KEY[:10]}...")
 
 PRODUCT_XML_URL = "https://eshop.marosko.sk/erp/impexp/specialexport/heureka"
-LLMS_TXT_URL = "https://marosko.sk/llms.txt"
+LLMS_TXT_URL = "https://www.marosko.sk/llms.txt"  # canonical host; the bare domain 308-redirects here
 
 # ------------------ JAZYK ODPOVEDE ------------------
 # Jazyk odpovede sa určuje z jazyka OTÁZKY (nie z locale frontendu):
@@ -105,6 +106,20 @@ def load_llms_context():
         return ""
 
 llms_context = load_llms_context()
+llms_context_loaded_at = time.time()
+LLMS_REFRESH_SECONDS = 6 * 3600  # matches marosko-web's own Heureka-review cache window
+
+def get_llms_context():
+    """Returns llms_context, refreshing it once the TTL above expires so a
+    long-running process (no restart for days) doesn't serve a stale site
+    map forever. Keeps the last-known-good text if a refresh attempt fails."""
+    global llms_context, llms_context_loaded_at
+    if time.time() - llms_context_loaded_at > LLMS_REFRESH_SECONDS:
+        fresh = load_llms_context()
+        llms_context_loaded_at = time.time()
+        if fresh and fresh.strip():
+            llms_context = fresh
+    return llms_context
 
 # ------------------ NAČÍTANIE PRODUKTOV Z XML ------------------
 def load_products_from_xml():
@@ -140,17 +155,30 @@ def load_products_from_xml():
     return products
 
 products = load_products_from_xml()
+products_loaded_at = time.time()
+PRODUCTS_REFRESH_SECONDS = 3600  # prices/stock change more often than the site map
+
+def get_products():
+    """Returns the product list, refreshing it once the TTL above expires —
+    same stale-cache problem and fix as get_llms_context() above."""
+    global products, products_loaded_at
+    if time.time() - products_loaded_at > PRODUCTS_REFRESH_SECONDS:
+        fresh = load_products_from_xml()
+        products_loaded_at = time.time()
+        if fresh:
+            products = fresh
+    return products
 
 # ------------------ VYHĽADÁVANIE PRODUKTU ------------------
 def find_product(query):
     query_lower = query.lower()
     words = [w for w in query_lower.split() if len(w) > 2]
-    
+
     best_match = None
     best_score = 0
     best_match_type = "weak"
-    
-    for p in products:
+
+    for p in get_products():
         score = 0
         if p['name'] in query_lower:
             score += 100
@@ -235,12 +263,13 @@ TVOJA ODPOVEĎ (začni riadkom LANG:xx):"""
             })
     
     # Všeobecná otázka
-    if llms_context and llms_context.strip():
+    current_llms_context = get_llms_context()
+    if current_llms_context and current_llms_context.strip():
         system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
-{llms_context}
+{current_llms_context}
 
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
