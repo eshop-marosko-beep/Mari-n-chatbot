@@ -192,6 +192,75 @@ def get_shipping_payment_info():
             shipping_payment_info = fresh
     return shipping_payment_info
 
+# ------------------ KATEGÓRIA NOVINKY ------------------
+# Ktoré produkty sú aktuálne "novinka" nevie povedať produktový XML feed —
+# ten nemá žiadny príznak novosti, len bežné údaje (názov/cena/popis). Táto
+# informácia existuje len ako poradie produktov na stránke kategórie Novinky
+# na e-shope, takže sa musí ťahať odtiaľ osobitne a pravidelne obnovovať
+# (zoznam sa časom mení, ako pribúdajú nové produkty).
+NOVINKY_URL = "https://eshop.marosko.sk/c/novinky-pre-rezbarov-naradie"
+
+def load_novinky_product_ids():
+    """Stiahne kategóriu Novinky a vráti ID produktov v poradí, v akom sa
+    tam zobrazujú (bez duplikátov — každý produkt má na stránke viac
+    odkazov, napr. obrázok aj názov)."""
+    print("🔄 Sťahujem kategóriu Novinky...")
+    try:
+        resp = requests.get(NOVINKY_URL, timeout=10)
+        resp.raise_for_status()
+        ids = re.findall(r'/p/(\d+)/', resp.text)
+        seen = []
+        for i in ids:
+            if i not in seen:
+                seen.append(i)
+        if not seen:
+            print("❌ Kategória Novinky: na stránke sa nenašiel žiadny produkt (zmenila sa štruktúra?).")
+            return []
+        print(f"✅ Kategória Novinky načítaná ({len(seen)} produktov).")
+        return seen
+    except Exception as e:
+        print(f"❌ Chyba pri sťahovaní kategórie Novinky: {e}")
+        return []
+
+novinky_product_ids = load_novinky_product_ids()
+novinky_product_ids_loaded_at = time.time()
+NOVINKY_REFRESH_SECONDS = 3600  # rovnaký interval ako produktový feed — zoznam noviniek sa mení podobne často
+
+def get_novinky_product_ids():
+    """Rovnaký TTL-refresh + last-known-good vzor ako get_shipping_payment_info()."""
+    global novinky_product_ids, novinky_product_ids_loaded_at
+    if time.time() - novinky_product_ids_loaded_at > NOVINKY_REFRESH_SECONDS:
+        fresh = load_novinky_product_ids()
+        novinky_product_ids_loaded_at = time.time()
+        if fresh:
+            novinky_product_ids = fresh
+    return novinky_product_ids
+
+
+def is_novinka(product):
+    """True, keď je daný produkt (z get_products()) aktuálne v kategórii Novinky."""
+    match = re.search(r'/p/(\d+)/', product['url'])
+    return bool(match) and match.group(1) in get_novinky_product_ids()
+
+
+def get_novinky_text(limit=15):
+    """Textový zoznam aktuálnych noviniek (názov, cena, odkaz) na vloženie
+    do promptu pre všeobecné otázky typu "aké máte novinky"."""
+    novinky_ids = get_novinky_product_ids()
+    if not novinky_ids:
+        return ""
+    by_id = {}
+    for p in get_products():
+        match = re.search(r'/p/(\d+)/', p['url'])
+        if match:
+            by_id[match.group(1)] = p
+    lines = []
+    for pid in novinky_ids[:limit]:
+        p = by_id.get(pid)
+        if p:
+            lines.append(f"- {p['original_name']} – {p['price']} € | {p['url']}")
+    return "\n".join(lines)
+
 # ------------------ NAČÍTANIE PRODUKTOV Z XML ------------------
 def load_products_from_xml():
     print("🔄 Sťahujem XML feed produktov...")
@@ -420,6 +489,7 @@ def chat():
             f"\n\nDOPRAVA A PLATBA (použi len ak sa zákazník pýta na dopravu/platbu k tomuto produktu):\n{current_shipping_payment_info}"
             if current_shipping_payment_info else ""
         )
+        novinka_note = "\nPOZNÁMKA: Tento produkt je aktuálne v kategórii Novinky." if is_novinka(product) else ""
         system_prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii — napríklad ak ťa zákazník už opravil alebo doplnil, neopakuj pôvodnú chybu.
 
 {LANGUAGE_INSTRUCTION}
@@ -430,7 +500,7 @@ PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
 CENA: {product['price']} € s DPH
 ODKAZ NA KÚPU: {clean_url_link}
-POPIS: {product['description']}{shipping_payment_block}"""
+POPIS: {product['description']}{novinka_note}{shipping_payment_block}"""
 
         messages = [{"role": "system", "content": system_prompt}] + history + [
             {"role": "user", "content": user_msg}
@@ -472,16 +542,21 @@ POPIS: {product['description']}{shipping_payment_block}"""
         f"\n\nDOPRAVA A PLATBA (použi, ak sa zákazník pýta na dopravu, dodanie alebo platbu):\n{current_shipping_payment_info}\n"
         if current_shipping_payment_info else ""
     )
+    current_novinky_text = get_novinky_text()
+    novinky_block = (
+        f"\n\nAKTUÁLNE NOVINKY V PONUKE (použi, ak sa zákazník pýta na novinky/čo je nové):\n{current_novinky_text}\n"
+        if current_novinky_text else ""
+    )
     if current_llms_context and current_llms_context.strip():
         system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
 {current_llms_context}
-{shipping_payment_block}
+{shipping_payment_block}{novinky_block}
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}"
+        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}{novinky_block}"
 
     messages = [{"role": "system", "content": system_prompt}] + history + [
         {"role": "user", "content": user_msg}
