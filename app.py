@@ -494,7 +494,7 @@ def chat():
 
 {LANGUAGE_INSTRUCTION}
 
-Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza, úprimne to priznaj namiesto vymýšľania. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Údaje o produkte nižšie sú v slovenčine — ak odpovedáš v inom jazyku, preformuluj ich.
+Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza (napríklad krajina pôvodu výrobcu, história značky alebo certifikáty), úprimne to priznaj namiesto vymýšľania — nikdy si takéto fakty nedomýšľaj z vlastných znalostí. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Údaje o produkte nižšie sú v slovenčine — ak odpovedáš v inom jazyku, preformuluj ich.
 
 PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
@@ -547,8 +547,13 @@ POPIS: {product['description']}{novinka_note}{shipping_payment_block}"""
         f"\n\nAKTUÁLNE NOVINKY V PONUKE (použi, ak sa zákazník pýta na novinky/čo je nové):\n{current_novinky_text}\n"
         if current_novinky_text else ""
     )
+    # Bez tohto bot vedel na otázky typu "aká je to značka/krajina pôvodu"
+    # (nemáme tento údaj v žiadnych podkladoch nižšie) odpovedať vymysleným
+    # "faktom" z vlastných (nepreverených) znalostí namiesto priznania, že to
+    # nevie — nahlásené naživo pri MANPA (bot si vymyslel krajinu pôvodu).
+    NO_FABRICATION_INSTRUCTION = "Nikdy nevymýšľaj fakty o výrobcoch/produktoch, ktoré nie sú uvedené v podkladoch nižšie (napr. krajina pôvodu, história značky, certifikáty) — ak sa na to zákazník pýta a nie je to v podkladoch, priznaj, že to nevieš, namiesto hádania."
     if current_llms_context and current_llms_context.strip():
-        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. {NO_FABRICATION_INSTRUCTION} Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
@@ -556,7 +561,7 @@ Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, 
 {shipping_payment_block}{novinky_block}
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}{novinky_block}"
+        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. {NO_FABRICATION_INSTRUCTION} Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}{novinky_block}"
 
     messages = [{"role": "system", "content": system_prompt}] + history + [
         {"role": "user", "content": user_msg}
