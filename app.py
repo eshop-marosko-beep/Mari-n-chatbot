@@ -144,6 +144,54 @@ def get_llms_context():
             llms_context = fresh
     return llms_context
 
+# ------------------ DOPRAVA A PLATBA ------------------
+# Táto informácia nie je ani v produktovom XML feede, ani v llms.txt — bot ju
+# doteraz nemal k dispozícii nikde, a tak na otázku "koľko stojí doprava"
+# odpovedal, že to nevie a treba nás kontaktovať, hoci ide o bežnú a vopred
+# zverejnenú informáciu na e-shope. Stránka je celá plná menu/kategórií;
+# zaujímavý text vyrežeme medzi dvoma stabilnými kotvami, ktoré sa na
+# stránke opakujú okolo skutočného obsahu.
+SHIPPING_PAYMENT_URL = "https://eshop.marosko.sk/mapa-nakup-rezbarskeho-naradia-online-obchod"
+_SHIPPING_PAYMENT_START_RE = re.compile(r'ceny:\s*všetky zobrazené ceny', re.IGNORECASE)
+_SHIPPING_PAYMENT_END_RE = re.compile(r'zvoľte kategóriu', re.IGNORECASE)
+
+def load_shipping_payment_info():
+    """Stiahne stránku Doprava a platba a vyrieže z nej len samotný text o
+    cenách dopravy a spôsoboch platby (bez okolitého menu/kategórií)."""
+    print("🔄 Sťahujem informácie o doprave a platbe...")
+    try:
+        resp = requests.get(SHIPPING_PAYMENT_URL, timeout=10)
+        resp.raise_for_status()
+        text = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', resp.text, flags=re.S)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'&nbsp;', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        start = _SHIPPING_PAYMENT_START_RE.search(text)
+        end = _SHIPPING_PAYMENT_END_RE.search(text, start.end() if start else 0)
+        if not start or not end:
+            print("❌ Informácie o doprave a platbe: kotvy sa na stránke nenašli (zmenila sa štruktúra?).")
+            return ""
+        print("✅ Informácie o doprave a platbe načítané.")
+        return text[start.start():end.start()].strip()
+    except Exception as e:
+        print(f"❌ Chyba pri načítaní informácií o doprave a platbe: {e}")
+        return ""
+
+shipping_payment_info = load_shipping_payment_info()
+shipping_payment_info_loaded_at = time.time()
+SHIPPING_PAYMENT_REFRESH_SECONDS = 24 * 3600  # ceny dopravy/platby sa menia zriedka
+
+def get_shipping_payment_info():
+    """Rovnaký TTL-refresh + last-known-good vzor ako get_llms_context()."""
+    global shipping_payment_info, shipping_payment_info_loaded_at
+    if time.time() - shipping_payment_info_loaded_at > SHIPPING_PAYMENT_REFRESH_SECONDS:
+        fresh = load_shipping_payment_info()
+        shipping_payment_info_loaded_at = time.time()
+        if fresh and fresh.strip():
+            shipping_payment_info = fresh
+    return shipping_payment_info
+
 # ------------------ NAČÍTANIE PRODUKTOV Z XML ------------------
 def load_products_from_xml():
     print("🔄 Sťahujem XML feed produktov...")
@@ -367,6 +415,11 @@ def chat():
         # v samostatnej karte pod odpoveďou. Jeden spoločný prompt so všetkými
         # údajmi to rieši bez ohľadu na presné znenie otázky.
         clean_url_link = clean_url(product['url'])
+        current_shipping_payment_info = get_shipping_payment_info()
+        shipping_payment_block = (
+            f"\n\nDOPRAVA A PLATBA (použi len ak sa zákazník pýta na dopravu/platbu k tomuto produktu):\n{current_shipping_payment_info}"
+            if current_shipping_payment_info else ""
+        )
         system_prompt = f"""Si odborný a priateľský poradca pre rezbárske náradie v e-shope Marosko. Zákazník sa pýta na konkrétny produkt nižšie. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii — napríklad ak ťa zákazník už opravil alebo doplnil, neopakuj pôvodnú chybu.
 
 {LANGUAGE_INSTRUCTION}
@@ -377,7 +430,7 @@ PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
 CENA: {product['price']} € s DPH
 ODKAZ NA KÚPU: {clean_url_link}
-POPIS: {product['description']}"""
+POPIS: {product['description']}{shipping_payment_block}"""
 
         messages = [{"role": "system", "content": system_prompt}] + history + [
             {"role": "user", "content": user_msg}
@@ -414,16 +467,21 @@ POPIS: {product['description']}"""
 
     # Všeobecná otázka
     current_llms_context = get_llms_context()
+    current_shipping_payment_info = get_shipping_payment_info()
+    shipping_payment_block = (
+        f"\n\nDOPRAVA A PLATBA (použi, ak sa zákazník pýta na dopravu, dodanie alebo platbu):\n{current_shipping_payment_info}\n"
+        if current_shipping_payment_info else ""
+    )
     if current_llms_context and current_llms_context.strip():
         system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
 {current_llms_context}
-
+{shipping_payment_block}
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek."
+        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}"
 
     messages = [{"role": "system", "content": system_prompt}] + history + [
         {"role": "user", "content": user_msg}
