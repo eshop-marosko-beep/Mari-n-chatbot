@@ -52,9 +52,9 @@ def append_to_history(session_id, user_msg, assistant_msg):
 # odpoveď (a pre núdzovú odpoveď pri zlyhaní DeepSeek) — tieto texty
 # AI nevidí, takže sa musia prekladať samostatne.
 LABELS = {
-    "sk": {"product": "Produkt", "buy": "Kúpiť", "price": "Cena", "vat_suffix": "s DPH", "contact": "pre podrobnosti nás kontaktujte"},
-    "cz": {"product": "Produkt", "buy": "Koupit", "price": "Cena", "vat_suffix": "s DPH", "contact": "pro podrobnosti nás kontaktujte"},
-    "ro": {"product": "Produs", "buy": "Cumpără", "price": "Preț", "vat_suffix": "cu TVA", "contact": "pentru detalii ne puteți contacta"},
+    "sk": {"product": "Produkt", "buy": "Kúpiť", "price": "Cena", "vat_suffix": "s DPH", "contact": "pre podrobnosti nás kontaktujte", "recommended": "Odporúčané produkty z ponuky"},
+    "cz": {"product": "Produkt", "buy": "Koupit", "price": "Cena", "vat_suffix": "s DPH", "contact": "pro podrobnosti nás kontaktujte", "recommended": "Doporučené produkty z nabídky"},
+    "ro": {"product": "Produs", "buy": "Cumpără", "price": "Preț", "vat_suffix": "cu TVA", "contact": "pentru detalii ne puteți contacta", "recommended": "Produse recomandate din ofertă"},
 }
 
 # AI dostane pokyn uviesť na prvom riadku svojej odpovede značku v tomto
@@ -166,8 +166,18 @@ def load_products_from_xml():
         clean_desc = re.sub(r'<[^>]+>', ' ', description)
         clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
         
+        name_lower = name.lower()
+        name_words = name_lower.split()
         products.append({
-            "name": name.lower(),
+            "name": name_lower,
+            # Susedné dvojice slov spojené bez medzery — zákazníci bežne
+            # píšu viacslovné názvy ako jedno slovo (napr. "Orbicut" pre
+            # feedom uvádzané "Orbi Cut"). Zámerne PRESNÁ zhoda len na
+            # SUSEDNÝCH slovách (nie spojenie celého názvu do jedného
+            # reťazca) — spájanie celého názvu vedelo omylom vytvoriť cudzie
+            # slovo na hranici dvoch nesúvisiacich slov (napr. "hrana" +
+            # "pr.9,5" → obsahuje aj "napr", bežné slovenské slovo "napr.").
+            "name_bigrams": {name_words[i] + name_words[i + 1] for i in range(len(name_words) - 1)},
             "original_name": name,
             "manufacturer": manufacturer.lower(),
             "price": price_vat,
@@ -193,22 +203,64 @@ def get_products():
     return products
 
 # ------------------ VYHĽADÁVANIE PRODUKTU ------------------
+# Bežné všeobecné podstatné mená z produktového/obchodného slovníka, ktoré
+# vedia byť dosť dlhé (6+ znakov) na to, aby ich find_product() nižšie
+# považoval za "dosť špecifické slovo samo o sebe" — v skutočnosti sa ale
+# vyskytujú v mnohých nesúvisiacich produktoch alebo bežnej konverzácii
+# (napr. "aké priemery máte?" nesmie vrátiť náhodný produkt len preto, že
+# slovo "priemery" je dlhé). Zoznam je zámerne len najčastejšie/najrizikovejšie
+# prípady, nie kompletný slovník — chýbajúce slovo len vráti pôvodné
+# (bezpečné) správanie, nikdy nespôsobí nový falošný zásah.
+GENERIC_PRODUCT_WORDS = {
+    "priemer", "priemery", "priemerov", "priemeru",
+    "skrutka", "skrutky", "skrutiek",
+    "rozmer", "rozmery", "rozmerov",
+    "material", "materialu", "materiálu",
+    "drevo", "dreva", "drevorezba", "drevorezbu", "drevorezby",
+    "farba", "farby", "farieb",
+    "naradie", "naradia", "nastroj", "nastroje", "nastroja",
+    "sada", "sady", "sadu",
+    "vyrobok", "vyrobky", "tovar", "tovaru", "tovary",
+    # Bežné názvy celých kategórií náradia — príliš všeobecné na to, aby
+    # samy osebe identifikovali KONKRÉTNY produkt (desiatky/stovky
+    # produktov obsahujú tieto slová vo svojom názve).
+    "brúska", "brúsky", "brusky", "bruska",
+    "frézka", "frézky", "frezka", "frezky",
+    "kotúč", "kotúče", "kotuc", "kotuce",
+    "nástavec", "nástavce", "nastavec", "nastavce",
+    "uhlová", "uhlovej", "uhlova", "uhlovou",
+    "dláto", "dláta", "dlato", "dlata",
+    "rašpľa", "rašple", "raspla", "rasple",
+}
+
+
 def find_product(query):
     """Nájde produkt, o ktorom sa zákazník pravdepodobne pýta.
 
     Zhoda ostáva na podreťazcoch (nie na celých slovách) zámerne — pri
     bohatej slovenskej/českej skloňovanej flektológii to funguje ako
     chudobná náhrada stemmingu (napr. "trojuholníkový" z otázky sa trafí
-    do "trojuholníkovým" v názve produktu). Predtým však vedela SAMOTNÁ
-    zhoda vo výrobcovi (`manufacturer`) sama o sebe pretiahnuť prah a
-    vrátiť celkom nesúvisiaci produkt, keď sa niektoré slovo z otázky
-    náhodou vyskytlo ako podreťazec v poli výrobcu niektorého z ~1250
-    produktov — bez akejkoľvek súvislosti s tým, o čom sa reálne
-    rozprávalo. Výrobca teda odteraz môže len PRIDAŤ body k produktu,
-    ktorý už má aspoň jednu zhodu vo vlastnom názve, nikdy nie sám o sebe
-    rozhodnúť."""
+    do "trojuholníkovým" v názve produktu). Porovnáva sa navyše proti
+    dvojiciam SUSEDNÝCH slov spojených bez medzery ("orbicut" zákazníka
+    nájde feedom uvádzané "Orbi Cut" — inak by ich rozdelila medzera
+    uprostred a bot by tvrdil, že cenu nepozná, hoci produkt v ponuke
+    reálne má); zámerne len susedné dvojice, nie spojenie celého názvu do
+    jedného reťazca, aby sa slovo neomylom netrafilo na hranici dvoch
+    nesúvisiacich slov ďaleko od seba. Predtým vedela SAMOTNÁ zhoda vo
+    výrobcovi (`manufacturer`) sama o sebe pretiahnuť prah a vrátiť celkom
+    nesúvisiaci produkt, keď sa niektoré slovo z otázky náhodou vyskytlo
+    ako podreťazec v poli výrobcu niektorého z ~1250 produktov — bez
+    akejkoľvek súvislosti s tým, o čom sa reálne rozprávalo. Výrobca teda
+    odteraz môže len PRIDAŤ body k produktu, ktorý už má aspoň jednu zhodu
+    vo vlastnom názve, nikdy nie sám o sebe rozhodnúť."""
     query_lower = query.lower()
-    words = [w for w in query_lower.split() if len(w) > 2]
+    # >3 (nie >2): trojpísmenové slová sú v slovenčine skoro vždy predložky
+    # alebo spojky ("pre", "bez", "ako", "ale"...), nikdy nič, čo by
+    # identifikovalo konkrétny produkt — a keď sa takéto slovo zhodou
+    # okolností vyskytlo aj v názve nejakého produktu, dokázalo spolu s
+    # jedným ďalším slabým zásahom pretiahnuť prah bez akejkoľvek reálnej
+    # súvislosti s otázkou.
+    words = [w for w in query_lower.split() if len(w) > 3]
 
     best_match = None
     best_score = 0
@@ -217,11 +269,17 @@ def find_product(query):
         name_score = 0
         if p['name'] in query_lower:
             name_score += 100
-        for word in words:
-            if word in p['name']:
-                name_score += 10
-        if name_score == 0:
+        matched_words = [w for w in words if w in p['name'] or w in p['name_bigrams']]
+        if not matched_words:
             continue
+        name_score += 10 * len(matched_words)
+        # Jedno dlhé/špecifické slovo (napr. "orbicut") je samo o sebe
+        # dostatočný dôkaz — inak by pri jedinom zhodnom slove nikdy nedosiahlo
+        # prah nižšie a bot by tvrdil, že produkt/cenu nepozná, hoci ho má.
+        # Bežné všeobecné slová (pozri GENERIC_PRODUCT_WORDS) sú z tohto
+        # bonusu vyňaté, aj keď sú rovnako dlhé.
+        if any(len(w) >= 6 and w not in GENERIC_PRODUCT_WORDS for w in matched_words):
+            name_score += 10
 
         score = name_score
         for word in words:
@@ -235,6 +293,60 @@ def find_product(query):
     if best_score >= 15:
         return best_match
     return None
+
+
+def find_products_mentioned(text, limit=3):
+    """Keď bot pri odpovedi na VŠEOBECNÚ otázku (nie priamu otázku na jeden
+    produkt) sám odporučí konkrétne nástroje/značky — napr. "skús Arbortech
+    Turbo Plane alebo frézky Manpa" — zákazník dostal len holé mená bez
+    ceny a odkazu na kúpu. Táto funkcia sa pokúsi k spomenutým značkám
+    dohľadať konkrétny reálny produkt z ponuky, aby sa dal pod odpoveď
+    pripojiť ako klikateľná karta (podobne ako pri priamej produktovej
+    otázke). Zámerne vracia najviac `limit` produktov, jeden na značku —
+    nie je to úplná zhoda, len najlepší odhad."""
+    text_lower = text.lower()
+    words = [w for w in re.findall(r'\w+', text_lower) if len(w) > 3]
+    if not words:
+        return []
+
+    # Výrobca býva vo feede uložený ako zložený reťazec (napr. "saburrtooth
+    # usa", "king arthur,usa") — zákazník/AI ale bežne spomenie len samotnú
+    # značku ("Saburrtooth"), takže sa neporovnáva celá fráza, len jej
+    # jednotlivé dosť dlhé (a teda dosť špecifické) slová.
+    manufacturers = {p['manufacturer'].strip() for p in get_products() if p['manufacturer'].strip()}
+    mentioned_manufacturers = set()
+    for m in manufacturers:
+        tokens = [t for t in re.findall(r'\w+', m) if len(t) >= 4]
+        if any(re.search(r'\b' + re.escape(t) + r'\b', text_lower) for t in tokens):
+            mentioned_manufacturers.add(m)
+    if not mentioned_manufacturers:
+        return []
+
+    best_by_manufacturer = {}
+    for p in get_products():
+        manufacturer = p['manufacturer'].strip()
+        if manufacturer not in mentioned_manufacturers:
+            continue
+        # Slová samotného výrobcu (napr. "saburrtooth") sa nepočítajú do
+        # zhody na produkte — inak by sa pri čisto všeobecnom spomenutí
+        # značky ("skús Saburrtooth alebo Manpa", bez konkrétneho modelu)
+        # vždy vybral nejaký ľubovoľný SKU tej značky, hoci text nehovoril
+        # o žiadnom konkrétnom z desiatok takmer identických variantov.
+        manufacturer_tokens = set(re.findall(r'\w+', manufacturer))
+        matched = [
+            w for w in words
+            if (w in p['name'] or w in p['name_bigrams'])
+            and w not in GENERIC_PRODUCT_WORDS and w not in manufacturer_tokens
+        ]
+        if not matched:
+            continue
+        score = 10 * len(matched)
+        current = best_by_manufacturer.get(manufacturer)
+        if current is None or score > current[1]:
+            best_by_manufacturer[manufacturer] = (p, score)
+
+    ranked = sorted(best_by_manufacturer.values(), key=lambda item: -item[1])
+    return [p for p, _ in ranked[:limit]]
 
 # ------------------ ENDPOINT /chat ------------------
 @app.route("/chat", methods=["POST"])
@@ -331,11 +443,22 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
         resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         ai_msg_raw = resp.json()["choices"][0]["message"]["content"]
-        _, ai_msg = extract_language(ai_msg_raw, user_msg)
+        locale, ai_msg = extract_language(ai_msg_raw, user_msg)
         # Vyčisti AI odpoveď od zátvoriek v URL
         ai_msg = clean_ai_response(ai_msg)
         append_to_history(session_id, user_msg, ai_msg)
-        return jsonify({"success": True, "response": ai_msg})
+
+        mentioned_products = find_products_mentioned(ai_msg)
+        if mentioned_products:
+            labels = LABELS[locale]
+            cards = "\n".join(
+                f"- {p['original_name']} – {p['price']} € | {clean_url(p['url'])}"
+                for p in mentioned_products
+            )
+            final_response = f"{ai_msg}\n\n---\n**{labels['recommended']}:**\n{cards}"
+        else:
+            final_response = ai_msg
+        return jsonify({"success": True, "response": final_response})
     except Exception as e:
         print(f"Chyba pri DeepSeek (všeobecná otázka): {e}")
         return jsonify({"success": False, "error": str(e)}), 500
