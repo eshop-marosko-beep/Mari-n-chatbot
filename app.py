@@ -1,12 +1,21 @@
 import os
 import re
 import time
+import unicodedata
 import uuid
 import requests
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+
+def strip_diacritics(text):
+    """"živica" -> "zivica". Zákazníci veľmi bežne píšu bez diakritiky
+    (telefón, cudzia klávesnica) a niektoré slovenské znaky (napr. "ž") sú
+    v ASCII-zápise úplne iné písmeno ako v pôvodnom slove, nielen chýbajúca
+    dĺžeň/mäkčeň — bez tohto sa také slovo nikdy nezhoduje ani čiastočne."""
+    return ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
 
 app = Flask(__name__)
 CORS(app, origins=['https://eshop.marosko.sk', 'https://www.eshop.marosko.sk'])
@@ -283,7 +292,11 @@ def load_products_from_xml():
         clean_desc = re.sub(r'<[^>]+>', ' ', description)
         clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()
         
-        name_lower = name.lower()
+        # "name" a "name_bigrams" sú zámerne BEZ diakritiky — porovnávané je
+        # s nimi len zákazníkovo dotazové slovo (tiež bez diakritiky, pozri
+        # find_product), nikde sa nezobrazujú. "original_name" nižšie ostáva
+        # pôvodný, presný názov na zobrazenie zákazníkovi.
+        name_lower = strip_diacritics(name.lower())
         name_words = name_lower.split()
         products.append({
             "name": name_lower,
@@ -348,7 +361,42 @@ GENERIC_PRODUCT_WORDS = {
     "uhlová", "uhlovej", "uhlova", "uhlovou",
     "dláto", "dláta", "dlato", "dlata",
     "rašpľa", "rašple", "raspla", "rasple",
+    "fréza", "frézy", "frézou", "frézu", "freza", "frezy", "frezou", "frezu",
+    "rezbárstvo", "rezbarstvo", "rezba", "rezbárske", "rezbarske", "rezbársky", "rezbarsky",
+    "tvarovanie", "tvarovacie", "tvarovací", "tvarovaci",
 }
+
+# Slovenčina/čeština majú bohaté skloňovanie — to isté slovo v inom páde má
+# inú koncovku (napr. "epoxidová" vs zákazníkovo "epoxidovu", bez diakritiky
+# aj s iným pádom). Podreťazcová zhoda vyžaduje zhodu VŠETKÝCH znakov, takže
+# aj slová líšiace sa len v jedinom poslednom znaku sa inak nikdy nenašli —
+# naživo to spôsobilo, že bot na otázku o epoxidovej živici na zalievanie
+# tvrdil, že ju v ponuke nemá, hoci ju reálne majú (Veropal). Namiesto
+# poriadneho stemmingu (na to by bola treba jazykovo špecifická knižnica)
+# porovnávame len prvých STEM_LENGTH znakov — chudobná, ale funkčná náhrada,
+# ktorá pokrýva presne tento typ chyby (rôzna koncovka, rovnaký slovný
+# základ).
+STEM_LENGTH = 6
+
+def _stem_candidates(word):
+    """Vráti množinu kandidátov na porovnanie so slovom z otázky.
+
+    Dlhšie slová (nad STEM_LENGTH) sa skrátia na prvých STEM_LENGTH znakov —
+    to zachytí spoločný slovný základ bez ohľadu na koncovku bez toho, aby
+    slovo skrátilo na príliš krátky, ľahko sa zrážajúci prefix. Slová
+    PRESNE na hranici (napr. 6-znakové "zivicu") skúsia navyše aj o jeden
+    znak kratšie ("zivic"), keďže tam skracovanie na plných STEM_LENGTH
+    znakov ešte nepomôže — koncovka zaberá presne posledný znak
+    ("zivicu"/"zivica" sa líšia len v ňom)."""
+    if len(word) > STEM_LENGTH:
+        return {word[:STEM_LENGTH]}
+    if len(word) == STEM_LENGTH:
+        return {word, word[:-1]}
+    return {word}
+
+# Porovnávané ako stemy BEZ diakritiky (nie presné slová), aby chytili aj
+# neuvedené pády tých istých všeobecných slov (napr. "skrutkami", "skrutkou"...).
+GENERIC_PRODUCT_STEMS = set().union(*(_stem_candidates(strip_diacritics(w)) for w in GENERIC_PRODUCT_WORDS))
 
 
 def find_product(query):
@@ -370,23 +418,26 @@ def find_product(query):
     akejkoľvek súvislosti s tým, o čom sa reálne rozprávalo. Výrobca teda
     odteraz môže len PRIDAŤ body k produktu, ktorý už má aspoň jednu zhodu
     vo vlastnom názve, nikdy nie sám o sebe rozhodnúť."""
-    query_lower = query.lower()
+    query_nodiac = strip_diacritics(query.lower())
     # >3 (nie >2): trojpísmenové slová sú v slovenčine skoro vždy predložky
     # alebo spojky ("pre", "bez", "ako", "ale"...), nikdy nič, čo by
     # identifikovalo konkrétny produkt — a keď sa takéto slovo zhodou
     # okolností vyskytlo aj v názve nejakého produktu, dokázalo spolu s
     # jedným ďalším slabým zásahom pretiahnuť prah bez akejkoľvek reálnej
     # súvislosti s otázkou.
-    words = [w for w in query_lower.split() if len(w) > 3]
+    words = [w for w in query_nodiac.split() if len(w) > 3]
 
     best_match = None
     best_score = 0
 
     for p in get_products():
         name_score = 0
-        if p['name'] in query_lower:
+        if p['name'] in query_nodiac:
             name_score += 100
-        matched_words = [w for w in words if w in p['name'] or w in p['name_bigrams']]
+        matched_words = [
+            w for w in words
+            if any(c in p['name'] for c in _stem_candidates(w)) or w in p['name_bigrams']
+        ]
         if not matched_words:
             continue
         name_score += 10 * len(matched_words)
@@ -395,7 +446,7 @@ def find_product(query):
         # prah nižšie a bot by tvrdil, že produkt/cenu nepozná, hoci ho má.
         # Bežné všeobecné slová (pozri GENERIC_PRODUCT_WORDS) sú z tohto
         # bonusu vyňaté, aj keď sú rovnako dlhé.
-        if any(len(w) >= 6 and w not in GENERIC_PRODUCT_WORDS for w in matched_words):
+        if any(len(w) >= 6 and not (_stem_candidates(w) & GENERIC_PRODUCT_STEMS) for w in matched_words):
             name_score += 10
 
         score = name_score
@@ -422,7 +473,9 @@ def find_products_mentioned(text, limit=3):
     otázke). Zámerne vracia najviac `limit` produktov, jeden na značku —
     nie je to úplná zhoda, len najlepší odhad."""
     text_lower = text.lower()
-    words = [w for w in re.findall(r'\w+', text_lower) if len(w) > 3]
+    # p['name'] je bez diakritiky (pozri load_products_from_xml), takže aj
+    # slová z textu treba pred porovnaním rovnako zbaviť diakritiky.
+    words = [w for w in re.findall(r'\w+', strip_diacritics(text_lower)) if len(w) > 3]
     if not words:
         return []
 
@@ -452,10 +505,16 @@ def find_products_mentioned(text, limit=3):
         manufacturer_tokens = set(re.findall(r'\w+', manufacturer))
         matched = [
             w for w in words
-            if (w in p['name'] or w in p['name_bigrams'])
-            and w not in GENERIC_PRODUCT_WORDS and w not in manufacturer_tokens
+            if (any(c in p['name'] for c in _stem_candidates(w)) or w in p['name_bigrams'])
+            and not (_stem_candidates(w) & GENERIC_PRODUCT_STEMS) and w not in manufacturer_tokens
         ]
-        if not matched:
+        # Tu (na rozdiel od find_product) treba aspoň 2 zhodné slová — text
+        # AI odpovede je oveľa dlhší a voľnejší ako zákazníkova otázka, takže
+        # jedno bežné slovo (napr. "stredný" — veľkosť remeňa vs. "Stredné
+        # tvarovanie" ako názov kroku v návode) sa v ňom nájde príliš ľahko
+        # náhodou. Táto karta je len doplnková ilustrácia k rade, nie priama
+        # odpoveď na otázku, tak sa oplatí byť tu konzervatívnejší.
+        if len(matched) < 2:
             continue
         score = 10 * len(matched)
         current = best_by_manufacturer.get(manufacturer)
