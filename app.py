@@ -736,7 +736,11 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
         # produkty, ktoré AI reálne spomenula (podľa odkazu v odpovedi), inak
         # prvých 5 zo zoznamu; pri čisto všeobecnej otázke pôvodná logika.
         if candidate_products:
-            mentioned_products = [p for p in candidate_products if clean_url(p['url']) in ai_msg][:5] or candidate_products[:5]
+            # porovnanie podľa čísla produktu (/p/123/), nie celej URL — odkaz vo
+            # feede môže mať navyše parameter varianty, ktorý AI v odpovedi vynechá
+            mentioned_ids = set(re.findall(r'/p/(\d+)/', ai_msg))
+            mentioned_products = [p for p in candidate_products
+                                  if (re.search(r'/p/(\d+)/', p['url']) or [None, None])[1] in mentioned_ids][:5] or candidate_products[:5]
         else:
             mentioned_products = find_products_mentioned(ai_msg)
         if mentioned_products:
