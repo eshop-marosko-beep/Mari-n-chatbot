@@ -162,7 +162,17 @@ def get_llms_context():
 # stránke opakujú okolo skutočného obsahu.
 SHIPPING_PAYMENT_URL = "https://eshop.marosko.sk/mapa-nakup-rezbarskeho-naradia-online-obchod"
 _SHIPPING_PAYMENT_START_RE = re.compile(r'ceny:\s*všetky zobrazené ceny', re.IGNORECASE)
-_SHIPPING_PAYMENT_END_RE = re.compile(r'zvoľte kategóriu', re.IGNORECASE)
+# Koniec užitočného textu: prvá z týchto kotiev, ktorá sa za začiatkom nájde.
+# Pôvodne bola jediná kotva "zvoľte kategóriu" — po úprave stránky na
+# e-shope zmizla, celý blok o doprave ostal prázdny a bot potom zákazníkov
+# posielal na interný llms.txt. Preto viac kotiev + núdzové orezanie na
+# pevnú dĺžku, aby zmena jedného textu na stránke už bota neodrezala od
+# informácií o doprave a platbe úplne.
+_SHIPPING_PAYMENT_END_RES = [
+    re.compile(r'kategórie produktov', re.IGNORECASE),
+    re.compile(r'zvoľte kategóriu', re.IGNORECASE),
+]
+SHIPPING_PAYMENT_MAX_CHARS = 3000
 
 def load_shipping_payment_info():
     """Stiahne stránku Doprava a platba a vyrieže z nej len samotný text o
@@ -177,12 +187,16 @@ def load_shipping_payment_info():
         text = re.sub(r'\s+', ' ', text).strip()
 
         start = _SHIPPING_PAYMENT_START_RE.search(text)
-        end = _SHIPPING_PAYMENT_END_RE.search(text, start.end() if start else 0)
-        if not start or not end:
-            print("❌ Informácie o doprave a platbe: kotvy sa na stránke nenašli (zmenila sa štruktúra?).")
+        if not start:
+            print("❌ Informácie o doprave a platbe: začiatok textu sa na stránke nenašiel (zmenila sa štruktúra?).")
             return ""
+        ends = [m.start() for m in (r.search(text, start.end()) for r in _SHIPPING_PAYMENT_END_RES) if m]
+        end_pos = min(ends) if ends else start.start() + SHIPPING_PAYMENT_MAX_CHARS
+        end_pos = min(end_pos, start.start() + SHIPPING_PAYMENT_MAX_CHARS)
+        if not ends:
+            print("⚠️ Informácie o doprave a platbe: koncová kotva sa nenašla, použité orezanie na pevnú dĺžku.")
         print("✅ Informácie o doprave a platbe načítané.")
-        return text[start.start():end.start()].strip()
+        return text[start.start():end_pos].strip()
     except Exception as e:
         print(f"❌ Chyba pri načítaní informácií o doprave a platbe: {e}")
         return ""
@@ -392,6 +406,10 @@ def _stem_candidates(word):
         return {word[:STEM_LENGTH]}
     if len(word) == STEM_LENGTH:
         return {word, word[:-1]}
+    # 5-znakové slová (napr. "dlata" vs. názvy "Dláto", "dlát") — bez
+    # odrezania koncovky sa nikdy nezhodli s iným pádom toho istého slova.
+    if len(word) == STEM_LENGTH - 1:
+        return {word, word[:-1]}
     return {word}
 
 # Porovnávané ako stemy BEZ diakritiky (nie presné slová), aby chytili aj
@@ -418,6 +436,20 @@ def find_product(query):
     akejkoľvek súvislosti s tým, o čom sa reálne rozprávalo. Výrobca teda
     odteraz môže len PRIDAŤ body k produktu, ktorý už má aspoň jednu zhodu
     vo vlastnom názve, nikdy nie sám o sebe rozhodnúť."""
+    ranked = rank_products(query)
+    return ranked[0][1] if ranked else None
+
+
+# Rozmery v otázke ("stopka 6 mm", "pr. 9,5 mm") — slová kratšie ako 4 znaky
+# sa pri bežnom porovnaní ignorujú, takže "6" ani "mm" by sa inak nikdy
+# nezohľadnili a rašpľa so stopkou 3,2 mm by mala rovnaké skóre ako 6 mm.
+_DIMENSION_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*mm\b')
+
+
+def rank_products(query):
+    """Všetky produkty, ktoré zodpovedajú otázke, zoradené od najlepšieho:
+    zoznam (skóre, produkt), len so skóre aspoň 15 (rovnaký prah ako predtým
+    pre jeden produkt). Bodovanie je pôvodné z find_product + bonus za rozmer."""
     query_nodiac = strip_diacritics(query.lower())
     # >3 (nie >2): trojpísmenové slová sú v slovenčine skoro vždy predložky
     # alebo spojky ("pre", "bez", "ako", "ale"...), nikdy nič, čo by
@@ -425,11 +457,12 @@ def find_product(query):
     # okolností vyskytlo aj v názve nejakého produktu, dokázalo spolu s
     # jedným ďalším slabým zásahom pretiahnuť prah bez akejkoľvek reálnej
     # súvislosti s otázkou.
-    words = [w for w in query_nodiac.split() if len(w) > 3]
+    # \w+ namiesto split(): inak ostala na slove interpunkcia ("dlata?"),
+    # ktorá zmenila jeho základ a slovo sa nezhodlo so žiadnym názvom.
+    words = [w for w in re.findall(r'\w+', query_nodiac) if len(w) > 3]
+    dims = {d.replace('.', ',') for d in _DIMENSION_RE.findall(query_nodiac)}
 
-    best_match = None
-    best_score = 0
-
+    ranked = []
     for p in get_products():
         name_score = 0
         if p['name'] in query_nodiac:
@@ -448,19 +481,55 @@ def find_product(query):
         # bonusu vyňaté, aj keď sú rovnako dlhé.
         if any(len(w) >= 6 and not (_stem_candidates(w) & GENERIC_PRODUCT_STEMS) for w in matched_words):
             name_score += 10
+        if dims:
+            name_compact = p['name'].replace(' ', '').replace('.', ',')
+            for d in dims:
+                # pred číslom nesmie byť číslica ani "číslica," (aby "9,5" nezhodlo "19,5"),
+                # ale "pr.9,5 mm" (bodka → čiarka) sa zhodnúť musí
+                if re.search(r'(?<!\d)(?<!\d,)' + re.escape(d) + r'mm', name_compact):
+                    name_score += 15
 
         score = name_score
         for word in words:
             if word in p['manufacturer']:
                 score += 5
 
-        if score > best_score:
-            best_score = score
-            best_match = p
+        if score >= 15:
+            ranked.append((score, p))
 
-    if best_score >= 15:
-        return best_match
-    return None
+    ranked.sort(key=lambda item: -item[0])
+    return ranked
+
+
+def product_base_name(p):
+    """Názov bez varianty ("…, Drsnosť Ihličiek … Zelená - Hrubá") — varianty
+    toho istého produktu sa pri výbere zoskupia, aby 8 miest v zozname
+    nezabrali len farby jedného nástroja."""
+    return p['original_name'].split(', ')[0].strip().lower()
+
+
+def select_products(query, max_products=8):
+    """Rozhodne, či sa zákazník pýta na JEDEN konkrétny produkt, alebo
+    všeobecne na skupinu produktov.
+
+    Predtým sa vždy vybral jediný najlepší produkt — pri všeobecnej otázke
+    ("rašple na stopke 6 mm", "máte dláta?") mali desiatky produktov rovnaké
+    skóre a vyhral náhodne prvý vo feede (rašplička so stopkou 3,2 mm, obal na
+    dláta). AI potom videla len ten jeden a tvrdila, že iné nemáme.
+
+    Vracia ("single", produkt), ("multi", [produkty]) alebo (None, None)."""
+    ranked = rank_products(query)
+    if not ranked:
+        return None, None
+    groups = OrderedDict()  # základný názov -> (najlepšie skóre, produkt)
+    for score, p in ranked:
+        base = product_base_name(p)
+        if base not in groups:
+            groups[base] = (score, p)
+    group_list = list(groups.values())
+    if len(group_list) == 1 or group_list[0][0] - group_list[1][0] >= 10:
+        return "single", group_list[0][1]
+    return "multi", [p for _, p in group_list[:max_products]]
 
 
 def find_products_mentioned(text, limit=3):
@@ -532,7 +601,9 @@ def chat():
     session_id = data.get("session_id") or "default"
     history = get_history(session_id)
 
-    product = find_product(user_msg)
+    mode, selected = select_products(user_msg)
+    product = selected if mode == "single" else None
+    candidate_products = selected if mode == "multi" else []
 
     if product:
         # Cena, výrobca aj odkaz idú do promptu vždy spolu s popisom — predtým sa
@@ -553,7 +624,7 @@ def chat():
 
 {LANGUAGE_INSTRUCTION}
 
-Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Ak sa niečo v údajoch nenachádza (napríklad krajina pôvodu výrobcu, história značky alebo certifikáty), úprimne to priznaj namiesto vymýšľania — nikdy si takéto fakty nedomýšľaj z vlastných znalostí. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Údaje o produkte nižšie sú v slovenčine — ak odpovedáš v inom jazyku, preformuluj ich.
+Odpovedz prirodzene, vecne a v plných vetách, nie len strohým výpisom údajov. Použi cenu, výrobcu aj popis, ak sú pre otázku relevantné. Máš údaje iba o tomto jednom produkte — nikdy netvrď, že iné produkty, varianty alebo rozmery v ponuke nemáme; ak sa zákazník pýta na iný rozmer či variant, povedz, že ponuka je širšia, a odporuč mu spresniť otázku alebo pozrieť kategóriu na eshop.marosko.sk. Ak sa niečo v údajoch nenachádza (napríklad krajina pôvodu výrobcu, história značky alebo certifikáty), úprimne to priznaj namiesto vymýšľania — nikdy si takéto fakty nedomýšľaj z vlastných znalostí. Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Údaje o produkte nižšie sú v slovenčine — ak odpovedáš v inom jazyku, preformuluj ich.
 
 PRODUKT: {product['original_name']}
 VÝROBCA: {product['manufacturer']}
@@ -611,16 +682,32 @@ POPIS: {product['description']}{novinka_note}{shipping_payment_block}"""
     # "faktom" z vlastných (nepreverených) znalostí namiesto priznania, že to
     # nevie — nahlásené naživo pri MANPA (bot si vymyslel krajinu pôvodu).
     NO_FABRICATION_INSTRUCTION = "Nikdy nevymýšľaj fakty o výrobcoch/produktoch, ktoré nie sú uvedené v podkladoch nižšie (napr. krajina pôvodu, história značky, certifikáty) — ak sa na to zákazník pýta a nie je to v podkladoch, priznaj, že to nevieš, namiesto hádania."
+    # llms.txt je interný podklad pre AI — zákazník ho nemá dostať ako odkaz
+    # (bot predtým pri chýbajúcich údajoch o doprave posielal zákazníka práve naň).
+    NO_INTERNAL_LINKS_INSTRUCTION = "Zákazníkovi nikdy neposielaj odkaz na súbor llms.txt ani na iné interné podklady — odkazuj len na bežné stránky e-shopu eshop.marosko.sk."
+    products_block = ""
+    if candidate_products:
+        product_lines = "\n".join(
+            f"- {p['original_name']} – {p['price']} € s DPH | {clean_url(p['url'])}"
+            for p in candidate_products
+        )
+        products_block = (
+            "\n\nPRODUKTY Z PONUKY, KTORÉ ZODPOVEDAJÚ OTÁZKE (vybrané podľa slov v otázke, nemusí ísť o úplný zoznam):\n"
+            f"{product_lines}\n"
+            "Pri odpovedi vychádzaj z tohto zoznamu: spomeň tie produkty, ktoré naozaj sedia na otázku (s cenou a odkazom), "
+            "a nespomínaj tie, ktoré nesedia. Nikdy netvrď, že niečo nemáme, ak to v zozname je; ak presne zodpovedajúci "
+            "produkt v zozname nie je, povedz, že toto sú najbližšie produkty, a odporuč pozrieť kategóriu alebo nás kontaktovať.\n"
+        )
     if current_llms_context and current_llms_context.strip():
-        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. {NO_FABRICATION_INSTRUCTION} Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
+        system_prompt = f"""Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. {NO_FABRICATION_INSTRUCTION} {NO_INTERNAL_LINKS_INSTRUCTION} Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek. Zohľadni pri odpovedi aj predchádzajúcu časť konverzácie nižšie, ak je k dispozícii.
 
 Tu máš informácie o e-shope Marosko (kategórie, dôležité stránky, blog, kontakty):
 
 {current_llms_context}
-{shipping_payment_block}{novinky_block}
+{shipping_payment_block}{novinky_block}{products_block}
 Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádzaj však priamo, že si čerpal z llms.txt. Odpovedaj prirodzene."""
     else:
-        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. {NO_FABRICATION_INSTRUCTION} Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}{novinky_block}"
+        system_prompt = f"Si odborný poradca pre rezbárske náradie. {LANGUAGE_INSTRUCTION} Buď užitočný a presný. Ak nepoznáš odpoveď, povedz to. {NO_FABRICATION_INSTRUCTION} {NO_INTERNAL_LINKS_INSTRUCTION} Keď zobrazuješ odkazy, používaj čisté URL bez zátvoriek.{shipping_payment_block}{novinky_block}{products_block}"
 
     messages = [{"role": "system", "content": system_prompt}] + history + [
         {"role": "user", "content": user_msg}
@@ -645,7 +732,13 @@ Použi tieto informácie, ak sú relevantné k otázke používateľa. Neuvádza
         ai_msg = clean_ai_response(ai_msg)
         append_to_history(session_id, user_msg, ai_msg)
 
-        mentioned_products = find_products_mentioned(ai_msg)
+        # Pri všeobecnej otázke na skupinu produktov sa ako karty pripoja
+        # produkty, ktoré AI reálne spomenula (podľa odkazu v odpovedi), inak
+        # prvých 5 zo zoznamu; pri čisto všeobecnej otázke pôvodná logika.
+        if candidate_products:
+            mentioned_products = [p for p in candidate_products if clean_url(p['url']) in ai_msg][:5] or candidate_products[:5]
+        else:
+            mentioned_products = find_products_mentioned(ai_msg)
         if mentioned_products:
             labels = LABELS[locale]
             cards = "\n".join(
